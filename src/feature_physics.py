@@ -46,7 +46,7 @@ def compute_physics_features(df: pd.DataFrame,
         'hour_sin', 'hour_cos', 'month_sin', 'month_cos',
         'doy_sin', 'doy_cos', 'log_clearsky_ghi',
         'log_precipitation', 'log_wind_speed',
-        't2m_celsius', 'd2m_celsius',
+        't2m_celsius', 'd2m_celsius', 'days_since_start'
     ]
 
     if os.path.exists(cache_path) and not force_recompute:
@@ -61,6 +61,13 @@ def compute_physics_features(df: pd.DataFrame,
 
     with timer("FEATURE_PHYSICS"):
         print("[FEATURE_PHYSICS] Computing physics-derived features...")
+
+        # ----------------------------------------------------------
+        # 0. Global Sensor Drift (days since start)
+        # ----------------------------------------------------------
+        min_date = df['timestamp'].min()
+        df['days_since_start'] = (df['timestamp'] - min_date).dt.total_seconds() / (24.0 * 3600.0)
+        df['days_since_start'] = df['days_since_start'].astype(DTYPE)
 
         # ----------------------------------------------------------
         # 1. Air Mass (Kasten & Young, 1989)

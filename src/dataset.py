@@ -143,6 +143,8 @@ class SolarDataset(Dataset):
                     'target_ghi': target_ghi[center],
                     'sample_id': ids[center],
                     'is_test': st_df['is_test'].iloc[center],
+                    'year': st_df['year'].iloc[center],
+                    'month': st_df['month'].iloc[center],
                 })
 
         # Compute or load normalization statistics
@@ -243,8 +245,8 @@ def create_train_val_datasets(df: pd.DataFrame, feature_cols: list,
     # Training data: rows with valid target (not test) AND not in val set
     has_target = df['radiation'].notna()
 
-    # Validation: even months of val_year
-    val_mask = (df['year'] == val_year) & (df['month'] % 2 == 0) & has_target
+    # Validation: Month 11 of val_year (simulating the temporal gap)
+    val_mask = (df['year'] == val_year) & (df['month'] == 11) & has_target
     # Training: everything else with a valid target
     train_mask = has_target & ~val_mask
 

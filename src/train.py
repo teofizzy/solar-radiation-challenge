@@ -16,24 +16,14 @@ from src.loss import ZindiSolarLoss, compute_zindi_score
 from src.utils import timer, get_device, clean_memory
 
 
-def get_train_val_indices(dataset, val_year: int = 2017):
+def get_train_val_indices(dataset, val_months: list = None):
     """
     Split dataset indices into train and validation sets.
-
-    Train: samples where target is valid AND month is odd (or year != val_year)
-    Val: samples where target is valid AND month is even AND year == val_year
-
-    Parameters
-    ----------
-    dataset : SolarDataset
-        Full dataset.
-    val_year : int
-        Year for validation.
-
-    Returns
-    -------
-    train_indices, val_indices : list of int
+    Validation: Samples where the month is in val_months.
     """
+    if val_months is None:
+        val_months = [3, 7, 11]
+
     train_indices = []
     val_indices = []
 
@@ -42,31 +32,18 @@ def get_train_val_indices(dataset, val_year: int = 2017):
         if sample['is_test'] == 1 or np.isnan(sample['target_kt']):
             continue
 
-        # Parse month from sample_id if available, otherwise skip
-        sid = sample['sample_id']
-        if isinstance(sid, str) and '_' in sid:
-            parts = sid.split('_')
-            if len(parts) >= 2:
-                try:
-                    year_month = parts[1]
-                    year = int(year_month.split('-')[0])
-                    month = int(year_month.split('-')[1])
+        month = sample['month']
 
-                    if year == val_year and month % 2 == 0:
-                        val_indices.append(i)
-                    else:
-                        train_indices.append(i)
-                    continue
-                except (ValueError, IndexError):
-                    pass
-
-        # Fallback: put in training
-        train_indices.append(i)
+        # Zindi strategy: Train on odd, Validate on odd (since even is hidden)
+        if month in val_months:
+            val_indices.append(i)
+        else:
+            train_indices.append(i)
 
     return train_indices, val_indices
 
 
-def train_model(dataset, feature_cols: list, val_year: int = 2017,
+def train_model(dataset, feature_cols: list, val_months: list = None,
                 model_save_dir: str = None):
     """
     Train the Physics-Informed BiLSTM with temporal CV.
@@ -77,8 +54,8 @@ def train_model(dataset, feature_cols: list, val_year: int = 2017,
         Full dataset with all samples.
     feature_cols : list
         Feature column names.
-    val_year : int
-        Year to use for validation split.
+    val_months : list
+        Months to use for validation split.
     model_save_dir : str
         Directory to save model checkpoints.
 
@@ -98,7 +75,7 @@ def train_model(dataset, feature_cols: list, val_year: int = 2017,
     os.makedirs(model_save_dir, exist_ok=True)
 
     # Split into train/val
-    train_indices, val_indices = get_train_val_indices(dataset, val_year)
+    train_indices, val_indices = get_train_val_indices(dataset, val_months)
     print(f"\n[TRAIN] Split: {len(train_indices)} train, {len(val_indices)} val")
 
     train_subset = Subset(dataset, train_indices)

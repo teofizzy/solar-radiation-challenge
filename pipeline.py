@@ -127,14 +127,29 @@ scaler_stats = dataset.get_scaler_stats()
 from src.train import train_model
 
 print("\n" + "=" * 70)
-print("PHASE A.7: Training BiLSTM")
+print("PHASE A.7: Training BiLSTM (2-Fold CV)")
 print("=" * 70)
 
-model, history = train_model(
-    dataset=dataset,
-    feature_cols=feature_cols,
-    val_year=2017,
-)
+folds = [
+    {'name': 'fold_1', 'val_months': [3, 7, 11]},
+    {'name': 'fold_2', 'val_months': [1, 5, 9]}
+]
+
+trained_models = []
+all_histories = []
+
+for fold in folds:
+    print(f"\n--- Training {fold['name'].upper()} ---")
+    model_save_dir = os.path.join(PATHS['experiments_dir'], fold['name'])
+    
+    model, history = train_model(
+        dataset=dataset,
+        feature_cols=feature_cols,
+        val_months=fold['val_months'],
+        model_save_dir=model_save_dir
+    )
+    trained_models.append(model)
+    all_histories.append(history)
 
 # ------------------------------------------------------------------
 # 8. Prediction (Phase A.8)
@@ -142,10 +157,10 @@ model, history = train_model(
 from src.predict import predict, generate_submission
 
 print("\n" + "=" * 70)
-print("PHASE A.8: Prediction and Submission")
+print("PHASE A.8: Prediction and Submission (Ensemble)")
 print("=" * 70)
 
-predictions = predict(dataset=dataset, model=model)
+predictions = predict(dataset=dataset, models=trained_models)
 submission = generate_submission(predictions)
 
 # ------------------------------------------------------------------
@@ -154,8 +169,10 @@ submission = generate_submission(predictions)
 print("\n" + "=" * 70)
 print("PIPELINE COMPLETE")
 print("=" * 70)
-print(f"  Best val Zindi score: {min(history['val_zindi']):.4f}")
-print(f"  Best val MBE:         {history['val_mbe'][np.argmin(history['val_zindi'])]:.2f}")
-print(f"  Best val RMSE:        {history['val_rmse'][np.argmin(history['val_zindi'])]:.2f}")
+for i, fold in enumerate(folds):
+    history = all_histories[i]
+    best_idx = np.argmin(history['val_zindi'])
+    print(f"  {fold['name'].upper()} Best Zindi: {history['val_zindi'][best_idx]:.4f} (MBE: {history['val_mbe'][best_idx]:.2f}, RMSE: {history['val_rmse'][best_idx]:.2f})")
 print(f"  Submission rows:      {len(submission):,}")
 print(f"  Submission saved to:  {PATHS['submissions_dir']}")
+

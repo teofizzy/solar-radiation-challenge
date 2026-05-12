@@ -14,7 +14,7 @@ from src.model_lstm import PhysicsInformedBiLSTM
 from src.utils import get_device, clean_memory
 
 
-def predict(dataset, model=None, model_path: str = None,
+def predict(dataset, models=None, model_paths: list = None,
             feature_cols: list = None, batch_size: int = None):
     """
     Run inference on the dataset and return predictions.
@@ -23,10 +23,10 @@ def predict(dataset, model=None, model_path: str = None,
     ----------
     dataset : SolarDataset
         Dataset to predict on.
-    model : PhysicsInformedBiLSTM or None
-        Trained model. If None, loads from model_path.
-    model_path : str or None
-        Path to model checkpoint.
+    models : list of PhysicsInformedBiLSTM or None
+        Trained models for ensembling.
+    model_paths : list of str or None
+        Paths to model checkpoints.
     feature_cols : list or None
         Feature column names (needed if loading model from checkpoint).
     batch_size : int or None
@@ -40,23 +40,31 @@ def predict(dataset, model=None, model_path: str = None,
     device = get_device()
     batch_size = batch_size or HPARAMS['batch_size'] * 4
 
-    # Load model if not provided
-    if model is None:
-        if model_path is None:
-            model_path = os.path.join(PATHS['experiments_dir'], 'best_model.pt')
+    # Load models if not provided
+    if models is None:
+        models = []
+        if model_paths is None:
+            model_paths = [
+                os.path.join(PATHS['experiments_dir'], 'fold_1', 'best_model.pt'),
+                os.path.join(PATHS['experiments_dir'], 'fold_2', 'best_model.pt')
+            ]
 
-        ckpt = torch.load(model_path, map_location=device, weights_only=False)
-        n_features = len(ckpt.get('feature_cols', feature_cols or []))
-        n_stations = get_n_stations()
+        for path in model_paths:
+            ckpt = torch.load(path, map_location=device, weights_only=False)
+            n_features = len(ckpt.get('feature_cols', feature_cols or []))
+            n_stations = get_n_stations()
 
-        model = PhysicsInformedBiLSTM(
-            n_features=n_features,
-            n_stations=n_stations,
-        ).to(device)
-        model.load_state_dict(ckpt['model_state_dict'])
-        print(f"[PREDICT] Loaded model from {model_path}")
-
-    model.eval()
+            m = PhysicsInformedBiLSTM(
+                n_features=n_features,
+                n_stations=n_stations,
+            ).to(device)
+            m.load_state_dict(ckpt['model_state_dict'])
+            m.eval()
+            models.append(m)
+            print(f"[PREDICT] Loaded model from {path}")
+    else:
+        for m in models:
+            m.eval()
 
     loader = DataLoader(
         dataset,
@@ -77,10 +85,15 @@ def predict(dataset, model=None, model_path: str = None,
             is_test = batch['is_test'].numpy()
             sample_ids = batch['sample_id']
 
-            with torch.amp.autocast('cuda', enabled=(device.type == 'cuda')):
-                kt_pred, ghi_pred = model(x, station_idx, clear_sky, is_night)
-
-            ghi_np = ghi_pred.cpu().numpy()
+            ensemble_ghi = []
+            
+            for m in models:
+                with torch.amp.autocast('cuda', enabled=(device.type == 'cuda')):
+                    _, ghi_pred = m(x, station_idx, clear_sky, is_night)
+                ensemble_ghi.append(ghi_pred.cpu().numpy())
+                
+            # Average across the ensemble
+            ghi_np = np.mean(ensemble_ghi, axis=0)
 
             for i in range(len(ghi_np)):
                 if is_test[i] == 1:
@@ -90,7 +103,7 @@ def predict(dataset, model=None, model_path: str = None,
                     pred_val = max(0.0, pred_val)
                     predictions[sid] = pred_val
 
-    print(f"[PREDICT] Generated {len(predictions)} test predictions")
+    print(f"[PREDICT] Generated {len(predictions)} test predictions using {len(models)}-model ensemble")
     clean_memory()
     return predictions
 
