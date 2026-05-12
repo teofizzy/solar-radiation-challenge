@@ -37,7 +37,8 @@ IS_COLAB = os.path.exists('/content')
 # Base project directory
 if IS_COLAB:
     PROJECT_DIR = '/content/drive/MyDrive/TAHMO_Challenge'
-    LOCAL_DATA_DIR = '/content/data'
+    # Use the same directory for data as they are all in the root folder
+    LOCAL_DATA_DIR = PROJECT_DIR 
 else:
     PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     LOCAL_DATA_DIR = os.path.join(PROJECT_DIR, 'data')
@@ -46,9 +47,7 @@ PATHS = {
     # Raw data
     'train': os.path.join(LOCAL_DATA_DIR, 'Train.csv'),
     'test': os.path.join(LOCAL_DATA_DIR, 'Test.csv'),
-    'station_meta': os.path.join(
-        PROJECT_DIR if not IS_COLAB else '/content', 'station_meta.csv'
-    ),
+    'station_meta': os.path.join(PROJECT_DIR, 'station_meta.csv'),
     'static_priors': os.path.join(LOCAL_DATA_DIR, 'clipped_africa_static_priors.nc'),
     'era5_dir': os.path.join(LOCAL_DATA_DIR, 'era5'),
     'sample_submission': os.path.join(LOCAL_DATA_DIR, 'SampleSubmission.csv'),
@@ -140,17 +139,19 @@ _STATION_META = None
 
 
 def get_station_meta():
-    """Lazy-load station metadata DataFrame."""
+    """Lazy-load station metadata DataFrame. Generates from Train.csv if missing."""
     global _STATION_META
     if _STATION_META is None:
         import pandas as pd
         meta_path = PATHS['station_meta']
         if not os.path.exists(meta_path):
-            # Fallback for Colab where station_meta might be in project root
-            alt_path = os.path.join(PROJECT_DIR, 'station_meta.csv')
-            if os.path.exists(alt_path):
-                meta_path = alt_path
-        _STATION_META = pd.read_csv(meta_path, index_col=0)
+            print(f"[CONFIG] station_meta.csv not found at {meta_path}. Generating from Train.csv...")
+            train_df = pd.read_csv(PATHS['train'], usecols=['station', 'latitude', 'longitude', 'elevation'])
+            _STATION_META = train_df.drop_duplicates(subset='station').set_index('station')
+            _STATION_META.to_csv(meta_path)
+            print(f"[CONFIG] Generated and saved station_meta.csv to {meta_path}")
+        else:
+            _STATION_META = pd.read_csv(meta_path, index_col=0)
     return _STATION_META
 
 
