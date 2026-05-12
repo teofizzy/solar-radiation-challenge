@@ -39,18 +39,27 @@ def compute_astro_features(df: pd.DataFrame,
     ensure_dirs()
     cache_path = os.path.join(PATHS['cache_astro'], 'astro_features.parquet')
 
-    if os.path.exists(cache_path) and not force_recompute:
-        print("[FEATURE_ASTRO] Loading from cache...")
-        df_astro = pd.read_parquet(cache_path)
-        # Merge astro features back to main df
-        astro_cols = ['solar_zenith', 'solar_azimuth', 'cos_zenith',
-                      'clear_sky_ghi', 'is_night', 'kt']
-        existing = [c for c in astro_cols if c in df.columns]
-        if existing:
-            df.drop(columns=existing, inplace=True)
-        df = df.merge(df_astro[astro_cols], left_index=True, right_index=True,
-                      how='left')
-        return df
+    recompute = force_recompute
+    if os.path.exists(cache_path) and not recompute:
+        try:
+            df_astro = pd.read_parquet(cache_path)
+            astro_cols = ['solar_zenith', 'solar_azimuth', 'cos_zenith',
+                          'clear_sky_ghi', 'is_night', 'kt']
+            missing = [c for c in astro_cols if c not in df_astro.columns]
+            if missing:
+                print(f"[FEATURE_ASTRO] Cache missing columns {missing}. Recomputing...")
+                recompute = True
+            else:
+                print("[FEATURE_ASTRO] Loading from cache...")
+                existing = [c for c in astro_cols if c in df.columns]
+                if existing:
+                    df.drop(columns=existing, inplace=True)
+                df = df.merge(df_astro[astro_cols], left_index=True, right_index=True,
+                              how='left')
+                return df
+        except Exception as e:
+            print(f"[FEATURE_ASTRO] Cache error: {e}. Recomputing...")
+            recompute = True
 
     with timer("FEATURE_ASTRO"):
         print("[FEATURE_ASTRO] Computing solar position and clear-sky GHI...")

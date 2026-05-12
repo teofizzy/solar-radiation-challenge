@@ -49,15 +49,25 @@ def compute_physics_features(df: pd.DataFrame,
         't2m_celsius', 'd2m_celsius', 'days_since_start'
     ]
 
-    if os.path.exists(cache_path) and not force_recompute:
-        print("[FEATURE_PHYSICS] Loading from cache...")
-        df_phys = pd.read_parquet(cache_path)
-        existing = [c for c in physics_cols if c in df.columns]
-        if existing:
-            df.drop(columns=existing, inplace=True)
-        df = df.merge(df_phys[physics_cols], left_index=True,
-                      right_index=True, how='left')
-        return df
+    recompute = force_recompute
+    if os.path.exists(cache_path) and not recompute:
+        try:
+            df_phys = pd.read_parquet(cache_path)
+            missing = [c for c in physics_cols if c not in df_phys.columns]
+            if missing:
+                print(f"[FEATURE_PHYSICS] Cache missing columns {missing}. Recomputing...")
+                recompute = True
+            else:
+                print("[FEATURE_PHYSICS] Loading from cache...")
+                existing = [c for c in physics_cols if c in df.columns]
+                if existing:
+                    df.drop(columns=existing, inplace=True)
+                df = df.merge(df_phys[physics_cols], left_index=True,
+                              right_index=True, how='left')
+                return df
+        except Exception as e:
+            print(f"[FEATURE_PHYSICS] Cache error: {e}. Recomputing...")
+            recompute = True
 
     with timer("FEATURE_PHYSICS"):
         print("[FEATURE_PHYSICS] Computing physics-derived features...")
