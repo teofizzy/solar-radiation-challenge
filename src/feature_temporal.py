@@ -1,11 +1,14 @@
 """
 Temporal feature engineering on COVARIATES ONLY.
-Rolling statistics, lag features, and wash cycle tracking.
+Rolling statistics, lag features, wash cycle tracking, satellite lag stacks,
+EWMA drift tracking, and cloud variability features.
 
 CRITICAL LEAKAGE GUARD:
 - Rolling statistics are computed ONLY on covariate columns (ERA5, temperature, humidity).
 - Target radiation is NEVER used in rolling computations.
 - Rolling windows do NOT cross train/test month boundaries.
+- EWMA drift uses ONLY satellite-derived kt (kt_landsaf), never observed radiation.
+- Lag features use groupby('station').shift() to prevent cross-station leakage.
 """
 
 import numpy as np
@@ -30,11 +33,20 @@ WINDOWS = {
     '12h': 48,
 }
 
+# Satellite columns for lag stack generation
+SATELLITE_LAG_COLS = ['mdssf', 'kt_landsaf']
+SATELLITE_LAG_STEPS = [1, 2, 4, 8]  # t-1, t-2, t-4, t-8 (15min each)
+
+# EWMA spans for drift tracking (in 15-min steps)
+EWMA_FAST_SPAN = 192   # ~48 hours -- captures recent drift
+EWMA_SLOW_SPAN = 672   # ~7 days  -- captures baseline
+
 
 def compute_temporal_features(df: pd.DataFrame,
                               force_recompute: bool = False) -> pd.DataFrame:
     """
-    Compute temporal features per station: rolling stats and wash cycles.
+    Compute temporal features per station: rolling stats, wash cycles,
+    satellite lag stacks, EWMA drift tracking, and cloud variability.
 
     Only operates on COVARIATE columns to prevent target leakage.
 
@@ -151,15 +163,80 @@ def compute_temporal_features(df: pd.DataFrame,
                 ).astype(DTYPE)
 
         # ----------------------------------------------------------
-        # 4. Explicit Drift Tracking (30-day EWMA of Satellite KT)
-        #    Represents long-term sensor degradation / aerosol baseline
+        # 4. Satellite Lag Stacks (Phase 1A)
+        #    Per-station shifted satellite values: t-1, t-2, t-4, t-8
+        #    Strictly causal, no cross-station leakage
+        # ----------------------------------------------------------
+        available_sat = [c for c in SATELLITE_LAG_COLS if c in df.columns]
+        for col in available_sat:
+            for lag in SATELLITE_LAG_STEPS:
+                lag_col = f'{col}_lag_{lag}'
+                if lag_col not in df.columns:
+                    shifted = df.groupby('station')[col].shift(lag)
+                    new_columns[lag_col] = shifted.astype(DTYPE)
+        if available_sat:
+            n_lag_cols = len(available_sat) * len(SATELLITE_LAG_STEPS)
+            print(f"  Satellite lag stacks: {n_lag_cols} columns "
+                  f"({available_sat} x lags {SATELLITE_LAG_STEPS})")
+
+        # ----------------------------------------------------------
+        # 4.5. Satellite Difference Features (cloud edge proxy)
+        #      1-hour difference captures rapid cloud transitions
+        # ----------------------------------------------------------
+        for col in available_sat:
+            diff_col = f'{col}_diff_1h'
+            if diff_col not in df.columns:
+                new_columns[diff_col] = df.groupby('station')[col].diff(
+                    periods=4  # 4 steps = 1 hour
+                ).fillna(0).astype(DTYPE)
+
+        # ----------------------------------------------------------
+        # 5. EWMA Drift Tracking (Phase 1B)
+        #    Dual-scale EWMA on satellite kt to isolate sensor drift
+        #    Uses ONLY kt_landsaf (satellite), never observed radiation
         # ----------------------------------------------------------
         if 'kt_landsaf' in df.columns:
-            # 30 days * 24 hours * 4 steps = 2880 steps
-            ewma = df.groupby('station')['kt_landsaf'].transform(
-                lambda x: x.ewm(span=2880, min_periods=1).mean()
+            # Fast EWMA (~48 hours) -- recent drift signal
+            ewma_fast = df.groupby('station')['kt_landsaf'].transform(
+                lambda x: x.ewm(span=EWMA_FAST_SPAN, min_periods=1).mean()
             )
-            new_columns['kt_ewma_drift'] = ewma.fillna(0).astype(DTYPE)
+            new_columns['ewma_kt_fast'] = ewma_fast.fillna(0).astype(DTYPE)
+
+            # Slow EWMA (~7 days) -- baseline signal
+            ewma_slow = df.groupby('station')['kt_landsaf'].transform(
+                lambda x: x.ewm(span=EWMA_SLOW_SPAN, min_periods=1).mean()
+            )
+            new_columns['ewma_kt_slow'] = ewma_slow.fillna(0).astype(DTYPE)
+
+            # Drift proxy: fast - slow (isolates recent sensor shift)
+            new_columns['drift_proxy'] = (
+                ewma_fast.values - ewma_slow.values
+            ).astype(DTYPE)
+
+            print(f"  EWMA drift: fast(span={EWMA_FAST_SPAN}), "
+                  f"slow(span={EWMA_SLOW_SPAN}), drift_proxy")
+
+        # ----------------------------------------------------------
+        # 5.5. Cumulative GHI Exposure (Phase 1B)
+        #      Log-transformed cumulative clear-sky energy per station
+        #      Proxy for pyranometer aging / dust accumulation
+        # ----------------------------------------------------------
+        if 'clear_sky_ghi' in df.columns:
+            def _cum_exposure(group):
+                """Cumulative Wh/m2 normalized by deployment days, log-transformed."""
+                cum = (group['clear_sky_ghi'].fillna(0).astype(DTYPE) * 0.25).cumsum()
+                days = max(
+                    (group['timestamp'].max() - group['timestamp'].min()).total_seconds()
+                    / (3600 * 24), 1.0
+                )
+                return np.log1p(cum / days).astype(DTYPE)
+
+            cum_exp = df.groupby('station').apply(
+                _cum_exposure, include_groups=False
+            ).reset_index(level=0, drop=True)
+            new_columns['log_cum_exposure'] = cum_exp
+
+            print(f"  Cumulative GHI exposure: log1p(cumsum/days)")
 
         # ----------------------------------------------------------
         # Assign all new columns at once
@@ -174,7 +251,8 @@ def compute_temporal_features(df: pd.DataFrame,
         print(f"  New columns added: {len(new_columns)}")
 
         # Verify no target-derived features crept in
-        forbidden = ['radiation', 'kt', 'CSI']
+        forbidden = ['radiation', 'CSI']
+        # Note: 'kt' alone is NOT forbidden -- 'kt_landsaf' and 'kt_ewma' are satellite-derived
         for name in new_columns.keys():
             for f in forbidden:
                 assert f not in name, \

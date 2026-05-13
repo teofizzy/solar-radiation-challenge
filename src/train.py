@@ -12,6 +12,7 @@ from torch.utils.data import DataLoader, Subset
 
 from src.config import HPARAMS, PATHS, SEED, WANDB_CONFIG, seed_everything, ensure_dirs, get_n_stations
 from src.model_lstm import PhysicsInformedBiLSTM
+from src.model_attention import AttentionBiLSTM
 from src.loss import ZindiSolarLoss, compute_zindi_score
 from src.utils import timer, get_device, clean_memory
 
@@ -127,36 +128,75 @@ def train_model(dataset, feature_cols: list, val_months: list = None,
         pin_memory=False,
     )
 
-    # Model
+    # Model selection: AttentionBiLSTM (default) or PhysicsInformedBiLSTM (fallback)
     n_features = len(feature_cols)
     n_stations = get_n_stations()
-    model = PhysicsInformedBiLSTM(
-        n_features=n_features,
-        n_stations=n_stations,
-        hidden_dim=HPARAMS['hidden_dim'],
-        n_layers=HPARAMS['n_layers'],
-        embed_dim=HPARAMS['embed_dim'],
-        dropout=HPARAMS['dropout'],
-    ).to(device)
+
+    use_attention = HPARAMS.get('use_attention', True)
+    if use_attention:
+        model = AttentionBiLSTM(
+            n_features=n_features,
+            n_stations=n_stations,
+            hidden_dim=HPARAMS['hidden_dim'],
+            n_layers=HPARAMS['n_layers'],
+            embed_dim=HPARAMS['embed_dim'],
+            dropout=HPARAMS['dropout'],
+            attn_dim=HPARAMS.get('attn_dim', 128),
+            attn_dropout=HPARAMS.get('attn_dropout', 0.10),
+            attn_temperature=HPARAMS.get('attn_temperature', 2.0),
+        ).to(device)
+        print(f"  Model: AttentionBiLSTM (Bahdanau attention, tau={HPARAMS.get('attn_temperature', 2.0)})")
+    else:
+        model = PhysicsInformedBiLSTM(
+            n_features=n_features,
+            n_stations=n_stations,
+            hidden_dim=HPARAMS['hidden_dim'],
+            n_layers=HPARAMS['n_layers'],
+            embed_dim=HPARAMS['embed_dim'],
+            dropout=HPARAMS['dropout'],
+        ).to(device)
+        print(f"  Model: PhysicsInformedBiLSTM (center-only)")
 
     print(f"  Model parameters: {sum(p.numel() for p in model.parameters()):,}")
 
-    # Optimizer and scheduler
+    # Optimizer
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=HPARAMS['lr'],
         weight_decay=HPARAMS['weight_decay'],
     )
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=HPARAMS['epochs'], eta_min=1e-6
-    )
 
-    # Loss function
+    # LR Scheduler: OneCycleLR (stepped per batch) or CosineAnnealing (fallback)
+    scheduler_type = HPARAMS.get('scheduler', 'onecycle')
+    steps_per_epoch = max(len(train_loader), 1)
+
+    if scheduler_type == 'onecycle':
+        scheduler = torch.optim.lr_scheduler.OneCycleLR(
+            optimizer,
+            max_lr=HPARAMS['lr'],
+            epochs=HPARAMS['epochs'],
+            steps_per_epoch=steps_per_epoch,
+            pct_start=HPARAMS.get('onecycle_pct_start', 0.12),
+            anneal_strategy='cos',
+            div_factor=HPARAMS.get('onecycle_div_factor', 25),
+            final_div_factor=HPARAMS.get('onecycle_final_div', 1e4),
+        )
+        step_scheduler_per_batch = True
+        print(f"  Scheduler: OneCycleLR (max_lr={HPARAMS['lr']}, pct_start={HPARAMS.get('onecycle_pct_start', 0.12)})")
+    else:
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=HPARAMS['epochs'], eta_min=1e-6
+        )
+        step_scheduler_per_batch = False
+        print(f"  Scheduler: CosineAnnealingLR")
+
+    # Loss function (spike-aware, no smoothness penalty)
     criterion = ZindiSolarLoss(
         mbe_weight=HPARAMS['mbe_weight'],
         rmse_weight=HPARAMS['rmse_weight'],
-        smoothness_weight=HPARAMS['smoothness_weight'],
         night_penalty_weight=HPARAMS['night_penalty_weight'],
+        spike_kt_threshold=HPARAMS.get('spike_kt_threshold', 0.7),
+        spike_weight=HPARAMS.get('spike_weight', 3.0),
     )
 
     # Mixed precision scaler
@@ -204,9 +244,15 @@ def train_model(dataset, feature_cols: list, val_months: list = None,
             scaler.step(optimizer)
             scaler.update()
 
+            # OneCycleLR steps per batch, not per epoch
+            if step_scheduler_per_batch:
+                scheduler.step()
+
             train_losses.append(loss_dict['total'])
 
-        scheduler.step()
+        # CosineAnnealing steps per epoch
+        if not step_scheduler_per_batch:
+            scheduler.step()
         avg_train_loss = np.mean(train_losses)
 
         # ---- Validation ----

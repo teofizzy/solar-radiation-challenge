@@ -7,7 +7,13 @@ Zindi scoring:
         MBE = mean(predicted - observed)
         RMSE = sqrt(mean((predicted - observed)^2))
 
-This loss function directly targets both metrics with optional physics penalties.
+This loss function directly targets both metrics with spike-aware weighting
+and physics-informed night penalties.
+
+CHANGE LOG:
+  - Removed smoothness penalty (operated on shuffled batches = gradient noise)
+  - Added spike-aware weighting: upweight errors when kt > 0.7 (weight=3.0)
+    to improve RMSE on clear-sky/high-transmittance events
 """
 
 import torch
@@ -16,7 +22,10 @@ import torch.nn as nn
 
 class ZindiSolarLoss(nn.Module):
     """
-    Combined loss: 0.5 * |MBE| + 0.5 * RMSE + physics_penalties
+    Combined loss: 0.5 * |MBE| + 0.5 * spike_weighted_RMSE + night_penalty
+
+    The spike-aware weighting upweights errors during high-kt events
+    (clear sky, cloud edges) where RMSE contributions are largest.
 
     Parameters
     ----------
@@ -24,20 +33,24 @@ class ZindiSolarLoss(nn.Module):
         Weight for |MBE| component (default 0.5).
     rmse_weight : float
         Weight for RMSE component (default 0.5).
-    smoothness_weight : float
-        Weight for kt temporal smoothness penalty.
     night_penalty_weight : float
         Weight for nighttime non-zero radiation penalty.
+    spike_kt_threshold : float
+        kt threshold above which errors are upweighted (default 0.7).
+    spike_weight : float
+        Multiplicative weight for high-kt errors (default 3.0).
     """
 
     def __init__(self, mbe_weight: float = 0.5, rmse_weight: float = 0.5,
-                 smoothness_weight: float = 0.02,
-                 night_penalty_weight: float = 0.01):
+                 night_penalty_weight: float = 0.01,
+                 spike_kt_threshold: float = 0.7,
+                 spike_weight: float = 3.0):
         super().__init__()
         self.mbe_weight = mbe_weight
         self.rmse_weight = rmse_weight
-        self.smoothness_weight = smoothness_weight
         self.night_penalty_weight = night_penalty_weight
+        self.spike_kt_threshold = spike_kt_threshold
+        self.spike_weight = spike_weight
 
     def forward(self, ghi_pred: torch.Tensor, ghi_target: torch.Tensor,
                 kt_pred: torch.Tensor = None, is_night: torch.Tensor = None):
@@ -51,7 +64,7 @@ class ZindiSolarLoss(nn.Module):
         ghi_target : Tensor (batch,)
             Target radiation in W/m2.
         kt_pred : Tensor (batch,) or None
-            Predicted clearness index for smoothness penalty.
+            Predicted clearness index for spike-aware weighting.
         is_night : Tensor (batch,) or None
             Nighttime flag for night penalty.
 
@@ -72,28 +85,32 @@ class ZindiSolarLoss(nn.Module):
         residuals = pred - target
 
         # --- MBE component ---
-        # |mean(residuals)| -- penalizes systematic bias
-        mbe = torch.abs(torch.mean(residuals))
+        # Differentiable approximation of |mean(residuals)|
+        mean_error = torch.mean(residuals)
+        mbe = torch.sqrt(mean_error ** 2 + 1e-8)
 
-        # --- RMSE component ---
-        # sqrt(mean(residuals^2)) -- penalizes large errors
-        rmse = torch.sqrt(torch.mean(residuals ** 2) + 1e-8)
+        # --- Spike-aware RMSE component ---
+        # Upweight errors during high-kt events where RMSE is dominated
+        squared_errors = residuals ** 2
+
+        if kt_pred is not None and self.spike_weight > 1.0:
+            kt_valid = kt_pred[valid_mask]
+            weights = torch.where(
+                kt_valid > self.spike_kt_threshold,
+                torch.tensor(self.spike_weight, device=pred.device),
+                torch.tensor(1.0, device=pred.device),
+            )
+            weighted_mse = torch.mean(squared_errors * weights)
+        else:
+            weighted_mse = torch.mean(squared_errors)
+
+        rmse = torch.sqrt(weighted_mse + 1e-8)
 
         # --- Combined primary loss ---
         primary_loss = self.mbe_weight * mbe + self.rmse_weight * rmse
 
-        # --- Physics penalties ---
+        # --- Night penalty (radiation should be zero at night) ---
         physics_loss = torch.tensor(0.0, device=ghi_pred.device)
-
-        # Smoothness penalty on kt (cloud transmittance is physically continuous)
-        if kt_pred is not None and self.smoothness_weight > 0:
-            kt_valid = kt_pred[valid_mask]
-            if len(kt_valid) > 1:
-                kt_diff = torch.diff(kt_valid)
-                smoothness = torch.mean(kt_diff ** 2)
-                physics_loss = physics_loss + self.smoothness_weight * smoothness
-
-        # Night penalty (radiation should be zero at night)
         if is_night is not None and self.night_penalty_weight > 0:
             night_mask = is_night[valid_mask] > 0.5
             if night_mask.any():
@@ -103,12 +120,15 @@ class ZindiSolarLoss(nn.Module):
 
         total_loss = primary_loss + physics_loss
 
+        # Unweighted RMSE for logging (matches Zindi metric exactly)
+        raw_rmse = torch.sqrt(torch.mean(squared_errors) + 1e-8)
+
         loss_dict = {
             'total': total_loss.item(),
-            'mbe': mbe.item(),
-            'rmse': rmse.item(),
+            'mbe': torch.abs(mean_error).item(),
+            'rmse': raw_rmse.item(),
             'physics': physics_loss.item(),
-            'zindi_score': (0.5 * mbe + 0.5 * rmse).item(),
+            'zindi_score': (0.5 * torch.abs(mean_error) + 0.5 * raw_rmse).item(),
         }
 
         return total_loss, loss_dict

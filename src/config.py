@@ -84,29 +84,49 @@ HPARAMS = {
     'half_window': 24,       # One side of the symmetric window
 
     # BiLSTM architecture
-    'hidden_dim': 128,
+    'hidden_dim': 192,       # Increased from 128 for attention capacity
     'n_layers': 2,
-    'dropout': 0.2,
+    'dropout': 0.15,         # Reduced from 0.2 (Bayesian opt literature)
     'embed_dim': 16,         # Station embedding dimension
 
+    # Attention architecture
+    'use_attention': True,   # Use CenterQueryAttention vs center-only
+    'attn_dim': 128,         # Attention projection dimension
+    'attn_dropout': 0.10,    # Attention weight dropout (unanimous consensus)
+    'attn_temperature': 2.0, # Score scaling tau (prevents collapse)
+
     # Training
-    'lr': 1e-3,
-    'weight_decay': 1e-4,
-    'batch_size': 64,
-    'epochs': 50,
-    'patience': 8,           # Early stopping patience
+    'lr': 3e-4,              # Reduced from 1e-3 for OneCycleLR stability
+    'weight_decay': 1e-3,    # Increased from 1e-4 (Gemini recommendation)
+    'batch_size': 128,       # Increased from 64 (literature)
+    'epochs': 80,            # Increased from 50 (longer with lower LR)
+    'patience': 15,          # Increased from 8 (match longer training)
     'grad_clip': 1.0,
+
+    # LR Scheduler (OneCycleLR)
+    'scheduler': 'onecycle',       # 'onecycle' or 'cosine'
+    'onecycle_pct_start': 0.12,    # Warmup fraction
+    'onecycle_div_factor': 25,     # Initial LR = max_lr / div_factor
+    'onecycle_final_div': 1e4,     # Final LR = max_lr / (div * final_div)
 
     # Loss weights
     'mbe_weight': 0.5,
     'rmse_weight': 0.5,
-    'smoothness_weight': 0.02,
     'night_penalty_weight': 0.01,
+    'spike_kt_threshold': 0.7,     # Upweight errors above this kt
+    'spike_weight': 3.0,           # Weight multiplier for high-kt errors
 
     # Physics
     'kt_max': 1.5,           # Max clearness index (cloud edge enhancement)
     'night_zenith_threshold': 90.0,
     'clearsky_min_denom': 1.0,  # Prevent division by zero in kt
+
+    # Post-processing (RTS smoother)
+    'rts_q_kt': 0.0018,     # Process noise for kt state
+    'rts_q_bias': 0.00008,  # Process noise for bias state
+    'rts_r': 0.012,         # Observation noise
+    'savgol_window': 9,     # Savitzky-Golay window (2.25 hours)
+    'savgol_polyorder': 2,  # Savitzky-Golay polynomial order
 }
 
 # ------------------------------------------------------------------

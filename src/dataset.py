@@ -54,12 +54,28 @@ def get_feature_columns(df: pd.DataFrame) -> list:
     # Add any temporal rolling columns
     rolling_cols = [c for c in df.columns if '_roll_' in c or '_diff_' in c or
                     c in ('volatility_index', 'hours_since_wash',
-                          'sticky_dust_index', 'kt_ewma_drift')]
+                          'sticky_dust_index')]
     candidates += sorted(rolling_cols)
+
+    # Add satellite lag stacks (e.g., mdssf_lag_1, kt_landsaf_lag_4)
+    lag_cols = [c for c in df.columns if '_lag_' in c]
+    candidates += sorted(lag_cols)
+
+    # Add EWMA drift features
+    ewma_cols = [c for c in df.columns if c.startswith('ewma_kt_') or
+                 c in ('drift_proxy', 'log_cum_exposure')]
+    candidates += sorted(ewma_cols)
 
     # Filter to only available columns
     available = [c for c in candidates if c in df.columns]
-    return available
+    # Deduplicate while preserving order
+    seen = set()
+    unique = []
+    for c in available:
+        if c not in seen:
+            seen.add(c)
+            unique.append(c)
+    return unique
 
 
 class SolarDataset(Dataset):
