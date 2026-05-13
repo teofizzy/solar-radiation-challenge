@@ -43,22 +43,34 @@ class PhysicsInformedCNNBiLSTM(nn.Module):
         # Input normalization
         self.input_norm = nn.LayerNorm(n_features + embed_dim)
 
-        # 1D-CNN for transient feature extraction
+        # 1D-CNN for transient feature extraction (3 layers)
         self.cnn = nn.Sequential(
-            nn.Conv1d(in_channels=n_features + embed_dim, out_channels=hidden_dim, 
-                      kernel_size=5, padding=2),
+            nn.Conv1d(in_channels=n_features + embed_dim, out_channels=hidden_dim // 2, kernel_size=3, padding=1),
             nn.GELU(),
-            nn.Dropout(dropout)
+            nn.BatchNorm1d(hidden_dim // 2),
+            nn.Conv1d(in_channels=hidden_dim // 2, out_channels=hidden_dim, kernel_size=3, padding=1),
+            nn.GELU(),
+            nn.BatchNorm1d(hidden_dim),
+            nn.Conv1d(in_channels=hidden_dim, out_channels=hidden_dim, kernel_size=3, padding=1),
+            nn.GELU(),
+            nn.BatchNorm1d(hidden_dim),
         )
+
+        # Transformer Sequence Fusion
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=hidden_dim, nhead=8, dim_feedforward=hidden_dim * 4, 
+            dropout=dropout, batch_first=True
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
 
         # Bidirectional LSTM
         self.bilstm = nn.LSTM(
             input_size=hidden_dim,
             hidden_size=hidden_dim,
-            num_layers=n_layers,
+            num_layers=1, # Reduced to 1 since Transformer handles deep sequence processing
             batch_first=True,
             bidirectional=True,
-            dropout=dropout if n_layers > 1 else 0.0,
+            dropout=0.0,
         )
 
         # Center-Query Additive Attention
@@ -79,8 +91,9 @@ class PhysicsInformedCNNBiLSTM(nn.Module):
         self.station_bias_head = nn.Sequential(
             nn.Linear(embed_dim, hidden_dim // 2),
             nn.GELU(),
-            nn.Dropout(dropout), # strong regularization to prevent overfit
-            nn.Linear(hidden_dim // 2, 1)
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim // 2, 1),
+            nn.Tanh() # dynamic bounding to prevent runaway corrections
         )
 
         self._init_weights()
@@ -117,8 +130,11 @@ class PhysicsInformedCNNBiLSTM(nn.Module):
         x_cnn = self.cnn(x_cnn)
         x_cnn = x_cnn.transpose(1, 2) # (batch, seq_len, hidden_dim)
 
+        # Transformer
+        x_trans = self.transformer(x_cnn) # (batch, seq_len, hidden_dim)
+
         # BiLSTM
-        lstm_out, _ = self.bilstm(x_cnn)  # (batch, seq_len, 2*hidden_dim)
+        lstm_out, _ = self.bilstm(x_trans)  # (batch, seq_len, 2*hidden_dim)
 
         # Center-Query Attention
         center_idx = self.half_window
@@ -132,8 +148,8 @@ class PhysicsInformedCNNBiLSTM(nn.Module):
         # Global Delta Kt (scaled to [-1.2, 1.2])
         global_delta_kt = self.global_head(context).squeeze(-1) * 1.2
         
-        # Final Delta Kt = Global + Bias
-        delta_kt_pred = global_delta_kt + station_bias
+        # Final Delta Kt = Global + Bias (Bias scaled to [-0.1, 0.1] to act as slight correction)
+        delta_kt_pred = global_delta_kt + (station_bias * 0.1)
 
         # Reconstruct Kt
         kt_pred = center_kt_landsaf + delta_kt_pred

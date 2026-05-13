@@ -83,10 +83,10 @@ HPARAMS = {
     'seq_len': 48,           # 24 past + 24 future = 12hr symmetric window
     'half_window': 24,       # One side of the symmetric window
 
-    # BiLSTM architecture
-    'hidden_dim': 192,       # Increased from 128 for attention capacity
+    # Transformer-BiLSTM architecture
+    'hidden_dim': 256,       # Scaled up for Transformer/BiLSTM capacity
     'n_layers': 2,
-    'dropout': 0.15,         # Reduced from 0.2 (Bayesian opt literature)
+    'dropout': 0.15,         # Matched to deeper architecture
     'embed_dim': 16,         # Station embedding dimension
 
     # Attention architecture
@@ -98,10 +98,10 @@ HPARAMS = {
     # Training
     'lr': 3e-4,              # Reduced from 1e-3 for OneCycleLR stability
     'weight_decay': 1e-3,    # Increased from 1e-4 (Gemini recommendation)
-    'batch_size': 128,       # Increased from 64 (literature)
+    'batch_size': 256,       # Scaled up for T4 GPU usage
     'epochs': 80,            # Increased from 50 (longer with lower LR)
     'patience': 15,          # Increased from 8 (match longer training)
-    'grad_clip': 1.0,
+    'grad_clip': 5.0,        # Relaxed for deep transformer fusion
 
     # LR Scheduler (OneCycleLR)
     'scheduler': 'onecycle',       # 'onecycle' or 'cosine'
@@ -138,7 +138,7 @@ WANDB_CONFIG = {
 }
 
 # ------------------------------------------------------------------
-# 4. FEATURE TOGGLES
+# 4. FEATURE TOGGLES & DEFINITIONS
 # ------------------------------------------------------------------
 FEATURES = {
     'use_era5': True,
@@ -147,6 +147,14 @@ FEATURES = {
     'use_landsaf': True,       # Phase C
     'use_static': False,       # Phase C
     'use_tropomi': True,       # Phase D (optional)
+}
+
+# 15-min intervals: 1h=4, 3h=12, 6h=24, 12h=48
+MULTI_SCALE_LAGS = {
+    '1h': 4,
+    '3h': 12,
+    '6h': 24,
+    '12h': 48
 }
 
 # ------------------------------------------------------------------

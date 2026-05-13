@@ -70,8 +70,8 @@ def predict(dataset, models=None, model_paths: list = None,
         dataset,
         batch_size=batch_size,
         shuffle=False,
-        num_workers=0,
-        pin_memory=False,
+        num_workers=4,
+        pin_memory=True,
     )
 
     predictions = {}

@@ -58,7 +58,8 @@ class ZindiSolarLoss(nn.Module):
 
     def forward(self, ghi_pred: torch.Tensor, ghi_target: torch.Tensor,
                 delta_kt_pred: torch.Tensor = None, delta_kt_target: torch.Tensor = None,
-                is_night: torch.Tensor = None, station_bias: torch.Tensor = None):
+                is_night: torch.Tensor = None, station_bias: torch.Tensor = None,
+                center_kt_landsaf: torch.Tensor = None):
         """
         Compute combined loss.
 
@@ -76,6 +77,8 @@ class ZindiSolarLoss(nn.Module):
             Nighttime flag for night penalty.
         station_bias : Tensor (batch,) or None
             Predicted station bias for L2 regularization.
+        center_kt_landsaf : Tensor (batch,) or None
+            Satellite clearness index for spike weighting.
 
         Returns
         -------
@@ -94,15 +97,27 @@ class ZindiSolarLoss(nn.Module):
         residuals = pred - target
 
         # --- MBE component ---
-        # Differentiable approximation of |mean(residuals)|
+        # Differentiable Huber approximation of |mean(residuals)|
         mean_error = torch.mean(residuals)
-        mbe = torch.sqrt(mean_error ** 2 + 1e-8)
+        abs_mean_error = torch.abs(mean_error)
+        # Huber threshold delta = 0.02
+        delta = 0.02
+        mbe = torch.where(abs_mean_error <= delta, 
+                          abs_mean_error ** 2 / (2 * delta), 
+                          abs_mean_error - delta / 2.0)
 
         # --- Spike-aware RMSE component ---
         # Upweight errors during high-kt events where RMSE is dominated
         squared_errors = residuals ** 2
-
-        weighted_mse = torch.mean(squared_errors)
+        
+        # Apply spike weight based on center_kt_landsaf
+        if center_kt_landsaf is not None:
+            kt_mask = (center_kt_landsaf[valid_mask] > self.spike_kt_threshold).float()
+            # weight = 1.0 + spike_weight * mask
+            weights = 1.0 + self.spike_weight * kt_mask
+            weighted_mse = torch.mean(weights * squared_errors)
+        else:
+            weighted_mse = torch.mean(squared_errors)
 
         rmse = torch.sqrt(weighted_mse + 1e-8)
 

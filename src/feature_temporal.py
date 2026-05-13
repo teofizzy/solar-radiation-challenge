@@ -15,7 +15,7 @@ import numpy as np
 import pandas as pd
 import os
 
-from src.config import PATHS, DTYPE, ensure_dirs
+from src.config import PATHS, DTYPE, MULTI_SCALE_LAGS, ensure_dirs
 from src.utils import timer
 
 
@@ -26,12 +26,7 @@ ROLLING_VARS = [
     'clear_sky_ghi', 'pw_attenuation',
 ]
 
-# Rolling window sizes (in number of 15-min steps)
-WINDOWS = {
-    '1h': 4,
-    '4h': 16,
-    '12h': 48,
-}
+# Using MULTI_SCALE_LAGS from config: '1h': 4, '3h': 12, '6h': 24, '12h': 48
 
 # Satellite columns for lag stack generation
 SATELLITE_LAG_COLS = ['mdssf', 'kt_landsaf']
@@ -87,14 +82,16 @@ def compute_temporal_features(df: pd.DataFrame,
         # 1. Rolling mean/std per station (covariates only)
         # ----------------------------------------------------------
         for var in available_rolling:
-            for window_name, window_size in WINDOWS.items():
+            for window_name, window_size in MULTI_SCALE_LAGS.items():
                 col_mean = f'{var}_roll_mean_{window_name}'
                 col_std = f'{var}_roll_std_{window_name}'
+                col_median = f'{var}_roll_median_{window_name}'
 
                 if col_mean not in df.columns:
+                    # CLOSED='RIGHT' AND CENTER=FALSE ENSURES STRICT CAUSALITY
                     roll = df.groupby('station')[var].transform(
                         lambda x: x.rolling(
-                            window=window_size, min_periods=1, center=True
+                            window=window_size, min_periods=1
                         ).mean()
                     )
                     new_columns[col_mean] = roll.astype(DTYPE)
@@ -102,10 +99,18 @@ def compute_temporal_features(df: pd.DataFrame,
                 if col_std not in df.columns:
                     roll_std = df.groupby('station')[var].transform(
                         lambda x: x.rolling(
-                            window=window_size, min_periods=2, center=True
+                            window=window_size, min_periods=2
                         ).std()
                     )
                     new_columns[col_std] = roll_std.fillna(0).astype(DTYPE)
+                
+                if col_median not in df.columns:
+                    roll_median = df.groupby('station')[var].transform(
+                        lambda x: x.rolling(
+                            window=window_size, min_periods=1
+                        ).median()
+                    )
+                    new_columns[col_median] = roll_median.fillna(0).astype(DTYPE)
 
         # ----------------------------------------------------------
         # 1.5. Wavelet Proxies (Multi-scale differences)
@@ -125,7 +130,7 @@ def compute_temporal_features(df: pd.DataFrame,
         # ----------------------------------------------------------
         if 'cos_zenith' in df.columns:
             vol = df.groupby('station')['cos_zenith'].transform(
-                lambda x: x.rolling(window=16, min_periods=2, center=True).std()
+                lambda x: x.rolling(window=16, min_periods=2).std()
             )
             new_columns['volatility_index'] = vol.fillna(0).astype(DTYPE)
 

@@ -114,8 +114,8 @@ def train_model(dataset, feature_cols: list, val_months: list = None,
         train_subset,
         batch_size=HPARAMS['batch_size'],
         shuffle=True,
-        num_workers=0,     # Colab-safe
-        pin_memory=False,  # Colab-safe
+        num_workers=4,     # Accelerated
+        pin_memory=True,   # Accelerated
         drop_last=True,
     )
 
@@ -123,8 +123,8 @@ def train_model(dataset, feature_cols: list, val_months: list = None,
         val_subset,
         batch_size=HPARAMS['batch_size'] * 2,
         shuffle=False,
-        num_workers=0,
-        pin_memory=False,
+        num_workers=4,
+        pin_memory=True,
     )
 
     # Model selection
@@ -219,7 +219,7 @@ def train_model(dataset, feature_cols: list, val_months: list = None,
 
             with torch.amp.autocast('cuda', enabled=(device.type == 'cuda')):
                 delta_kt_pred, ghi_pred, station_bias = model(x, station_idx, clear_sky, is_night, center_kt_landsaf)
-                loss, loss_dict = criterion(ghi_pred, target_ghi, delta_kt_pred, target_delta_kt, is_night, station_bias)
+                loss, loss_dict = criterion(ghi_pred, target_ghi, delta_kt_pred, target_delta_kt, is_night, station_bias, center_kt_landsaf)
 
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
