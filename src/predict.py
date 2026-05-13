@@ -10,7 +10,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from src.config import HPARAMS, PATHS, ensure_dirs, get_n_stations
-from src.model_lstm import PhysicsInformedBiLSTM
+from src.model_lstm import PhysicsInformedCNNBiLSTM
 from src.utils import get_device, clean_memory
 
 
@@ -54,7 +54,7 @@ def predict(dataset, models=None, model_paths: list = None,
             n_features = len(ckpt.get('feature_cols', feature_cols or []))
             n_stations = get_n_stations()
 
-            m = PhysicsInformedBiLSTM(
+            m = PhysicsInformedCNNBiLSTM(
                 n_features=n_features,
                 n_stations=n_stations,
             ).to(device)
@@ -82,6 +82,7 @@ def predict(dataset, models=None, model_paths: list = None,
             station_idx = batch['station_idx'].to(device)
             clear_sky = batch['clear_sky_ghi'].to(device)
             is_night = batch['is_night'].to(device)
+            center_kt_landsaf = batch['center_kt_landsaf'].to(device)
             is_test = batch['is_test'].numpy()
             sample_ids = batch['sample_id']
 
@@ -89,7 +90,7 @@ def predict(dataset, models=None, model_paths: list = None,
             
             for m in models:
                 with torch.amp.autocast('cuda', enabled=(device.type == 'cuda')):
-                    _, ghi_pred = m(x, station_idx, clear_sky, is_night)
+                    _, ghi_pred, _ = m(x, station_idx, clear_sky, is_night, center_kt_landsaf)
                 ensemble_ghi.append(ghi_pred.cpu().numpy())
                 
             # Average across the ensemble

@@ -87,8 +87,9 @@ class SolarDataset(Dataset):
         station_idx: int -- station index for embedding
         clear_sky_ghi: float -- clear-sky GHI at center timestep
         is_night: int -- nighttime flag at center timestep
-        target_kt: float -- clearness index at center (NaN for test)
+        target_delta_kt: float -- clearness index residual at center (NaN for test)
         target_ghi: float -- radiation at center (NaN for test)
+        center_kt_landsaf: float -- LandSAF clearness index at center (available everywhere)
 
     Parameters
     ----------

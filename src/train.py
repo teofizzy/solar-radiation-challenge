@@ -34,7 +34,7 @@ def get_train_val_indices(dataset, val_months: list = None):
 
     for i, sample in enumerate(dataset.samples):
         # Skip test samples (no target)
-        if sample['is_test'] == 1 or np.isnan(sample['target_kt']):
+        if sample['is_test'] == 1 or np.isnan(sample['target_delta_kt']):
             continue
 
         month = sample['month']
