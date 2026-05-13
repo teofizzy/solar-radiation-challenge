@@ -97,82 +97,82 @@ def compute_tropomi_features(df: pd.DataFrame, force_recompute: bool = False) ->
     with timer("FEATURE_TROPOMI"):
         print("[FEATURE_TROPOMI] Processing TROPOMI geospatial data...")
         meta = get_station_meta()
-    
-    # 1. Extract daily data
-    if os.path.exists(PATHS['tropomi_cloud_dir']):
-        df_cloud = extract_daily_tropomi(PATHS['tropomi_cloud_dir'], 'CLOUD', meta)
-    else:
-        df_cloud = pd.DataFrame()
-        
-    if os.path.exists(PATHS['tropomi_aerosol_dir']):
-        df_aero = extract_daily_tropomi(PATHS['tropomi_aerosol_dir'], 'AEROSOL', meta)
-    else:
-        df_aero = pd.DataFrame()
 
-    # 2. Map to 15-min meteorological DataFrame
-    df_tropo = pd.DataFrame(index=df.index)
-    df_tropo['date'] = df['timestamp'].dt.normalize()
-    df_tropo['station'] = df['station']
-    
-    # Merge daily values (will be NaN for days without overpass)
-    temp_df = df_tropo.reset_index().merge(
-        df_cloud, left_on=['date', 'station'], right_index=True, how='left'
-    )
-    if len(df_aero) > 0:
-        temp_df = temp_df.merge(
-            df_aero, left_on=['date', 'station'], right_index=True, how='left'
-        )
-    temp_df.set_index('index', inplace=True)
-    
-    # 3. AI STRATEGY: Stepwise Persistence + Missing Masks + Age
-    # Forward fill limit = 96 (24 hours at 15-min intervals)
-    for var in ['cloud', 'aerosol']:
-        col_name = f'tropomi_{var}'
-        if col_name in temp_df.columns:
-            # Create missing mask FIRST (1 if missing, 0 if present)
-            # A value is present if the day has an observation
-            # We track the "freshness" using the original NaN gaps
-            
-            is_observed = temp_df[col_name].notna()
-            
-            # Forward fill
-            filled = temp_df.groupby('station')[col_name].ffill(limit=96).astype(DTYPE)
-            
-            # Fill remaining with station climatology or 0
-            df_tropo[col_name] = filled.fillna(0.0)
-            
-            # Missing mask: 1 if the filled value is still NaN (or was originally NaN and wasn't filled)
-            # Wait, the AI said: tropomi_missing_mask = 1 if no observation *within the ffill window*
-            # Let's say: 1 if the value is derived from a 0.0 fill, 0 if it came from TROPOMI
-            df_tropo[f'{col_name}_missing'] = filled.isna().astype(DTYPE)
-            
-            # Age hours feature
-            # Groupby station, find time since last observation
-            # Since observations are daily at 00:00 (normalized), the age is just hours since that day
-            
-            # Create a Series of the last observation time
-            obs_times = df['timestamp'].copy()
-            obs_times[~is_observed] = pd.NaT
-            last_obs_time = obs_times.groupby(df['station']).ffill(limit=96)
-            
-            # Compute age in hours
-            age_hours = (df['timestamp'] - last_obs_time).dt.total_seconds() / 3600.0
-            
-            # For NaNs (outside the 24h window), cap age at 24.0 or set to a large value
-            df_tropo[f'{col_name}_age_hours'] = age_hours.fillna(24.0).astype(DTYPE)
-            
+        # 1. Extract daily data
+        if os.path.exists(PATHS['tropomi_cloud_dir']):
+            df_cloud = extract_daily_tropomi(PATHS['tropomi_cloud_dir'], 'CLOUD', meta)
         else:
-            df_tropo[col_name] = np.float32(0.0)
-            df_tropo[f'{col_name}_missing'] = np.float32(1.0)
-            df_tropo[f'{col_name}_age_hours'] = np.float32(24.0)
+            df_cloud = pd.DataFrame()
+            
+        if os.path.exists(PATHS['tropomi_aerosol_dir']):
+            df_aero = extract_daily_tropomi(PATHS['tropomi_aerosol_dir'], 'AEROSOL', meta)
+        else:
+            df_aero = pd.DataFrame()
 
-    # Drop intermediate columns
-    df_tropo.drop(columns=['date', 'station'], inplace=True)
+        # 2. Map to 15-min meteorological DataFrame
+        df_tropo = pd.DataFrame(index=df.index)
+        df_tropo['date'] = df['timestamp'].dt.normalize()
+        df_tropo['station'] = df['station']
 
-    # Cache
-    os.makedirs(PATHS['cache_tropomi'], exist_ok=True)
-    df_tropo.to_parquet(cache_path)
-    print(f"  Cached TROPOMI features to {cache_path}")
+        # 3. Merge daily values (will be NaN for days without overpass)
+        #    Guard: only merge if extracted DataFrame is non-empty AND has the
+        #    expected MultiIndex (date, station). Otherwise skip gracefully.
+        temp_df = df_tropo.reset_index()
+
+        if len(df_cloud) > 0 and isinstance(df_cloud.index, pd.MultiIndex):
+            temp_df = temp_df.merge(
+                df_cloud, left_on=['date', 'station'], right_index=True, how='left'
+            )
+        else:
+            # No cloud data: add placeholder column
+            for col in [c for c in df_cloud.columns] if len(df_cloud) > 0 else []:
+                temp_df[col] = np.nan
+
+        if len(df_aero) > 0 and isinstance(df_aero.index, pd.MultiIndex):
+            temp_df = temp_df.merge(
+                df_aero, left_on=['date', 'station'], right_index=True, how='left'
+            )
+
+        temp_df.set_index('index', inplace=True)
+        
+        # 4. AI STRATEGY: Stepwise Persistence + Missing Masks + Age
+        # Forward fill limit = 96 (24 hours at 15-min intervals)
+        for var in ['cloud', 'aerosol']:
+            col_name = f'tropomi_{var}'
+            if col_name in temp_df.columns:
+                # Create missing mask FIRST (1 if missing, 0 if present)
+                is_observed = temp_df[col_name].notna()
+                
+                # Forward fill
+                filled = temp_df.groupby('station')[col_name].ffill(limit=96).astype(DTYPE)
+                
+                # Fill remaining with 0
+                df_tropo[col_name] = filled.fillna(0.0)
+                
+                # Missing mask
+                df_tropo[f'{col_name}_missing'] = filled.isna().astype(DTYPE)
+                
+                # Age hours feature
+                obs_times = df['timestamp'].copy()
+                obs_times[~is_observed] = pd.NaT
+                last_obs_time = obs_times.groupby(df['station']).ffill(limit=96)
+                
+                # Compute age in hours
+                age_hours = (df['timestamp'] - last_obs_time).dt.total_seconds() / 3600.0
+                df_tropo[f'{col_name}_age_hours'] = age_hours.fillna(24.0).astype(DTYPE)
+                
+            else:
+                df_tropo[col_name] = np.float32(0.0)
+                df_tropo[f'{col_name}_missing'] = np.float32(1.0)
+                df_tropo[f'{col_name}_age_hours'] = np.float32(24.0)
+
+        # Drop intermediate columns
+        df_tropo.drop(columns=['date', 'station'], inplace=True)
+
+        # Cache
+        os.makedirs(PATHS['cache_tropomi'], exist_ok=True)
+        df_tropo.to_parquet(cache_path)
+        print(f"  Cached TROPOMI features to {cache_path}")
 
     # Merge into main df
     df = df.merge(df_tropo, left_index=True, right_index=True, how='left')
