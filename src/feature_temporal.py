@@ -96,6 +96,18 @@ def compute_temporal_features(df: pd.DataFrame,
                     new_columns[col_std] = roll_std.fillna(0).astype(DTYPE)
 
         # ----------------------------------------------------------
+        # 1.5. Wavelet Proxies (Multi-scale differences)
+        # ----------------------------------------------------------
+        for var in ['temperature', 'relativehumidity', 'clear_sky_ghi']:
+            if var in df.columns:
+                # 1h (4 steps), 3h (12 steps), 6h (24 steps) differences
+                for lag, lag_name in [(4, '1h'), (12, '3h'), (24, '6h')]:
+                    col_diff = f'{var}_diff_{lag_name}'
+                    if col_diff not in df.columns:
+                        diff = df.groupby('station')[var].diff(periods=lag)
+                        new_columns[col_diff] = diff.fillna(0).astype(DTYPE)
+
+        # ----------------------------------------------------------
         # 2. Clear-sky Volatility Index (rolling std of clearness proxy)
         #    Uses cos_zenith as a proxy for atmospheric transmittance
         # ----------------------------------------------------------
@@ -137,6 +149,17 @@ def compute_temporal_features(df: pd.DataFrame,
                 new_columns['sticky_dust_index'] = (
                     wash_hours.values * (1 - rh)
                 ).astype(DTYPE)
+
+        # ----------------------------------------------------------
+        # 4. Explicit Drift Tracking (30-day EWMA of Satellite KT)
+        #    Represents long-term sensor degradation / aerosol baseline
+        # ----------------------------------------------------------
+        if 'kt_landsaf' in df.columns:
+            # 30 days * 24 hours * 4 steps = 2880 steps
+            ewma = df.groupby('station')['kt_landsaf'].transform(
+                lambda x: x.ewm(span=2880, min_periods=1).mean()
+            )
+            new_columns['kt_ewma_drift'] = ewma.fillna(0).astype(DTYPE)
 
         # ----------------------------------------------------------
         # Assign all new columns at once

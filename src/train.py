@@ -10,10 +10,15 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Subset
 
-from src.config import HPARAMS, PATHS, SEED, seed_everything, ensure_dirs, get_n_stations
+from src.config import HPARAMS, PATHS, SEED, WANDB_CONFIG, seed_everything, ensure_dirs, get_n_stations
 from src.model_lstm import PhysicsInformedBiLSTM
 from src.loss import ZindiSolarLoss, compute_zindi_score
 from src.utils import timer, get_device, clean_memory
+
+try:
+    import wandb
+except ImportError:
+    wandb = None
 
 
 def get_train_val_indices(dataset, val_months: list = None):
@@ -44,7 +49,7 @@ def get_train_val_indices(dataset, val_months: list = None):
 
 
 def train_model(dataset, feature_cols: list, val_months: list = None,
-                model_save_dir: str = None):
+                model_save_dir: str = None, use_wandb: bool = False):
     """
     Train the Physics-Informed BiLSTM with temporal CV.
 
@@ -58,6 +63,8 @@ def train_model(dataset, feature_cols: list, val_months: list = None,
         Months to use for validation split.
     model_save_dir : str
         Directory to save model checkpoints.
+    use_wandb : bool
+        If True, log metrics to Weights & Biases.
 
     Returns
     -------
@@ -73,6 +80,28 @@ def train_model(dataset, feature_cols: list, val_months: list = None,
     if model_save_dir is None:
         model_save_dir = PATHS['experiments_dir']
     os.makedirs(model_save_dir, exist_ok=True)
+
+    if use_wandb and wandb is not None:
+        # If wandb.run is None, it means the sweep or pipeline hasn't initialized it yet.
+        if wandb.run is None:
+            # Try to get API key from Colab userdata
+            try:
+                from google.colab import userdata
+                wandb_api_key = userdata.get('WANDB_API_KEY')
+                if wandb_api_key:
+                    wandb.login(key=wandb_api_key)
+            except ImportError:
+                pass
+            
+            wandb.init(
+                project=WANDB_CONFIG['project'],
+                entity=WANDB_CONFIG['entity'],
+                config=HPARAMS,
+                reinit='allow'
+            )
+        # Update HPARAMS if wandb sweep modified them.
+        # wandb.config is not a plain dict; wrap in dict() to avoid TypeError.
+        HPARAMS.update(dict(wandb.config))
 
     # Split into train/val
     train_indices, val_indices = get_train_val_indices(dataset, val_months)
@@ -228,6 +257,16 @@ def train_model(dataset, feature_cols: list, val_months: list = None,
                   f"Val MBE: {val_mbe:.2f} | Val RMSE: {val_rmse:.2f} | "
                   f"Val Zindi: {val_zindi:.2f} | LR: {current_lr:.6f}")
 
+        if use_wandb and wandb is not None:
+            wandb.log({
+                'epoch': epoch + 1,
+                'train/loss': avg_train_loss,
+                'val/mbe': val_mbe,
+                'val/rmse': val_rmse,
+                'val/zindi_score': val_zindi,
+                'lr': current_lr
+            })
+
         # Early stopping + best model saving
         if val_zindi < best_val_score:
             best_val_score = val_zindi
@@ -250,8 +289,9 @@ def train_model(dataset, feature_cols: list, val_months: list = None,
                 break
 
     # Load best model
+    best_model_path = os.path.join(model_save_dir, 'best_model.pt')
     best_ckpt = torch.load(
-        os.path.join(model_save_dir, 'best_model.pt'),
+        best_model_path,
         map_location=device, weights_only=False
     )
     model.load_state_dict(best_ckpt['model_state_dict'])
@@ -259,6 +299,15 @@ def train_model(dataset, feature_cols: list, val_months: list = None,
           f"Zindi={best_ckpt['val_zindi']:.2f}, "
           f"MBE={best_ckpt['val_mbe']:.2f}, "
           f"RMSE={best_ckpt['val_rmse']:.2f}")
+
+    if use_wandb and wandb is not None:
+        artifact = wandb.Artifact('best-model', type='model')
+        artifact.add_file(best_model_path)
+        wandb.log_artifact(artifact)
+        
+        # We don't finish the run here if it's a sweep, sweep agent handles it.
+        # But if it was init manually, we can finish it. 
+        # Actually it's safer to let the caller handle wandb.finish() if needed.
 
     clean_memory()
     return model, history

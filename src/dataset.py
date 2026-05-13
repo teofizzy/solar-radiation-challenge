@@ -29,8 +29,9 @@ PHYSICS_FEATURES = [
     'air_mass', 'wind_speed', 'log_wind_speed',
     'wind_direction_sin', 'wind_direction_cos',
     'dewpoint_depression', 'pw_attenuation', 'turbidity_proxy',
-    'hour_sin', 'hour_cos', 'month_sin', 'month_cos',
-    'doy_sin', 'doy_cos',
+    'hour_sin', 'hour_cos', 'hour_12_sin', 'hour_12_cos', 
+    'hour_6_sin', 'hour_6_cos', 'hour_3_sin', 'hour_3_cos',
+    'month_sin', 'month_cos', 'doy_sin', 'doy_cos', 'days_since_start'
 ]
 
 # Use log_precipitation instead of raw precipitation (z-range 62 -> ~5)
@@ -39,18 +40,21 @@ LOCAL_FEATURES = ['temperature', 'relativehumidity', 'log_precipitation']
 # Temporal features (rolling stats) -- added dynamically if present
 # Not listed here since they are generated programmatically
 
+LANDSAF_FEATURES = ['mdssf', 'mlst', 'kt_landsaf']
+TROPOMI_FEATURES = ['tropomi_cloud', 'tropomi_cloud_missing', 'tropomi_cloud_age_hours', 
+                    'tropomi_aerosol', 'tropomi_aerosol_missing', 'tropomi_aerosol_age_hours']
 
 def get_feature_columns(df: pd.DataFrame) -> list:
     """
     Determine which feature columns are available in the DataFrame.
     Returns the ordered list of feature column names for model input.
     """
-    candidates = ASTRO_FEATURES + ERA5_FEATURES + PHYSICS_FEATURES + LOCAL_FEATURES
+    candidates = ASTRO_FEATURES + ERA5_FEATURES + PHYSICS_FEATURES + LOCAL_FEATURES + LANDSAF_FEATURES + TROPOMI_FEATURES
 
     # Add any temporal rolling columns
-    rolling_cols = [c for c in df.columns if '_roll_' in c or
+    rolling_cols = [c for c in df.columns if '_roll_' in c or '_diff_' in c or
                     c in ('volatility_index', 'hours_since_wash',
-                          'sticky_dust_index')]
+                          'sticky_dust_index', 'kt_ewma_drift')]
     candidates += sorted(rolling_cols)
 
     # Filter to only available columns
@@ -245,10 +249,14 @@ def create_train_val_datasets(df: pd.DataFrame, feature_cols: list,
     # Training data: rows with valid target (not test) AND not in val set
     has_target = df['radiation'].notna()
 
-    # Validation: Month 11 of val_year (simulating the temporal gap)
-    val_mask = (df['year'] == val_year) & (df['month'] == 11) & has_target
-    # Training: everything else with a valid target
-    train_mask = has_target & ~val_mask
+    # Validation: months specified in val_months
+    # Note: `val_months` logic is handled during dataset split in train.py, 
+    # but for initial dataset creation, we just create the full temporal dataset.
+    
+    # We actually don't need a val_mask here if we rely on `get_train_val_indices` 
+    # in train.py to do the splitting. We just pass the dataset.
+    df_train = df.copy()
+    df_val = df.copy()
 
     # But we need the full temporal context (including test rows) for windowing
     # So we pass full station data but mark which rows are trainable

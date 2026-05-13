@@ -43,8 +43,9 @@ def compute_physics_features(df: pd.DataFrame,
     physics_cols = [
         'air_mass', 'wind_speed', 'wind_direction_sin', 'wind_direction_cos',
         'dewpoint_depression', 'pw_attenuation', 'turbidity_proxy',
-        'hour_sin', 'hour_cos', 'month_sin', 'month_cos',
-        'doy_sin', 'doy_cos', 'log_clearsky_ghi',
+        'hour_sin', 'hour_cos', 'hour_12_sin', 'hour_12_cos', 
+        'hour_6_sin', 'hour_6_cos', 'hour_3_sin', 'hour_3_cos',
+        'month_sin', 'month_cos', 'doy_sin', 'doy_cos', 'log_clearsky_ghi',
         'log_precipitation', 'log_wind_speed',
         't2m_celsius', 'd2m_celsius', 'days_since_start'
     ]
@@ -173,6 +174,15 @@ def compute_physics_features(df: pd.DataFrame,
         hour_frac = df['hour'].values + df['minute'].values / 60.0
         df['hour_sin'] = np.sin(2 * np.pi * hour_frac / 24.0).astype(DTYPE)
         df['hour_cos'] = np.cos(2 * np.pi * hour_frac / 24.0).astype(DTYPE)
+        
+        df['hour_12_sin'] = np.sin(2 * np.pi * hour_frac / 12.0).astype(DTYPE)
+        df['hour_12_cos'] = np.cos(2 * np.pi * hour_frac / 12.0).astype(DTYPE)
+        
+        df['hour_6_sin'] = np.sin(2 * np.pi * hour_frac / 6.0).astype(DTYPE)
+        df['hour_6_cos'] = np.cos(2 * np.pi * hour_frac / 6.0).astype(DTYPE)
+        
+        df['hour_3_sin'] = np.sin(2 * np.pi * hour_frac / 3.0).astype(DTYPE)
+        df['hour_3_cos'] = np.cos(2 * np.pi * hour_frac / 3.0).astype(DTYPE)
 
         month = df['month'].values.astype(np.float32)
         df['month_sin'] = np.sin(2 * np.pi * month / 12.0).astype(DTYPE)

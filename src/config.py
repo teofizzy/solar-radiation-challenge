@@ -110,15 +110,23 @@ HPARAMS = {
 }
 
 # ------------------------------------------------------------------
-# 3. FEATURE TOGGLES
+# 3. W&B MLOps CONFIGURATION
+# ------------------------------------------------------------------
+WANDB_CONFIG = {
+    'project': 'tahmo-solar-radiation',
+    'entity': None,          # Use default entity
+}
+
+# ------------------------------------------------------------------
+# 4. FEATURE TOGGLES
 # ------------------------------------------------------------------
 FEATURES = {
     'use_era5': True,
     'use_physics': True,
     'use_temporal': True,
-    'use_landsaf': False,      # Phase C
+    'use_landsaf': True,       # Phase C
     'use_static': False,       # Phase C
-    'use_tropomi': False,      # Phase D (optional)
+    'use_tropomi': True,       # Phase D (optional)
 }
 
 # ------------------------------------------------------------------
