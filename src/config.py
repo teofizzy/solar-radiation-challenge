@@ -80,8 +80,8 @@ PATHS = {
 # ------------------------------------------------------------------
 HPARAMS = {
     # Sequence / windowing
-    'seq_len': 48,           # 24 past + 24 future = 12hr symmetric window
-    'half_window': 24,       # One side of the symmetric window
+    'seq_len': 96,           # 48 past + 48 future = 24hr symmetric window
+    'half_window': 48,       # One side of the symmetric window
 
     # Transformer-BiLSTM architecture
     'hidden_dim': 256,       # Scaled up for Transformer/BiLSTM capacity
@@ -99,7 +99,7 @@ HPARAMS = {
     'lr': 3e-4,              # Reduced from 1e-3 for OneCycleLR stability
     'weight_decay': 1e-3,    # Increased from 1e-4 (Gemini recommendation)
     'batch_size': 256,       # Scaled up for T4 GPU usage
-    'epochs': 80,            # Increased from 50 (longer with lower LR)
+    'epochs': 120,            # Increased from 50 (longer with lower LR)
     'patience': 15,          # Increased from 8 (match longer training)
     'grad_clip': 5.0,        # Relaxed for deep transformer fusion
 
@@ -145,7 +145,7 @@ FEATURES = {
     'use_physics': True,
     'use_temporal': True,
     'use_landsaf': True,       # Phase C
-    'use_static': False,       # Phase C
+    'use_static': True,       # Phase C
     'use_tropomi': True,       # Phase D (optional)
 }
 
