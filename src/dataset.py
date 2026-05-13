@@ -133,11 +133,17 @@ class SolarDataset(Dataset):
             clear_sky = st_df['clear_sky_ghi'].values.astype(np.float32)
             is_night = st_df['is_night'].values.astype(np.int8)
 
-            # Target: kt (NaN for test rows)
-            if 'kt' in st_df.columns:
-                target_kt = st_df['kt'].values.astype(np.float32)
+            # Target: Delta kt = kt_obs - kt_landsaf (NaN for test rows)
+            if 'kt' in st_df.columns and 'kt_landsaf' in st_df.columns:
+                target_delta_kt = (st_df['kt'].values - st_df['kt_landsaf'].values).astype(np.float32)
             else:
-                target_kt = np.full(n_rows, np.nan, dtype=np.float32)
+                target_delta_kt = np.full(n_rows, np.nan, dtype=np.float32)
+                
+            # Need kt_landsaf at center to reconstruct kt from delta_kt
+            if 'kt_landsaf' in st_df.columns:
+                center_kt_landsaf = st_df['kt_landsaf'].values.astype(np.float32)
+            else:
+                center_kt_landsaf = np.full(n_rows, np.nan, dtype=np.float32)
 
             # Raw radiation target
             if 'radiation' in st_df.columns:
@@ -159,8 +165,9 @@ class SolarDataset(Dataset):
                     'station_idx': station_idx,
                     'clear_sky_ghi': clear_sky[center],
                     'is_night': is_night[center],
-                    'target_kt': target_kt[center],
+                    'target_delta_kt': target_delta_kt[center],
                     'target_ghi': target_ghi[center],
+                    'center_kt_landsaf': center_kt_landsaf[center],
                     'sample_id': ids[center],
                     'is_test': st_df['is_test'].iloc[center],
                     'year': st_df['year'].iloc[center],
@@ -234,8 +241,9 @@ class SolarDataset(Dataset):
             'station_idx': torch.tensor(sample['station_idx'], dtype=torch.long),
             'clear_sky_ghi': torch.tensor(sample['clear_sky_ghi'], dtype=torch.float32),
             'is_night': torch.tensor(sample['is_night'], dtype=torch.float32),
-            'target_kt': torch.tensor(sample['target_kt'], dtype=torch.float32),
+            'target_delta_kt': torch.tensor(sample['target_delta_kt'], dtype=torch.float32),
             'target_ghi': torch.tensor(sample['target_ghi'], dtype=torch.float32),
+            'center_kt_landsaf': torch.tensor(sample['center_kt_landsaf'], dtype=torch.float32),
             'is_test': torch.tensor(sample['is_test'], dtype=torch.uint8),
             'sample_id': sample['sample_id'],
         }
@@ -294,7 +302,7 @@ def create_train_val_datasets(df: pd.DataFrame, feature_cols: list,
     train_indices = []
     val_indices = []
     for i, sample in enumerate(train_dataset.samples):
-        if sample['is_test'] == 1 or np.isnan(sample['target_kt']):
+        if sample['is_test'] == 1 or np.isnan(sample['target_delta_kt']):
             continue
         # Check if this is a val sample
         sample_id = sample['sample_id']
@@ -303,7 +311,7 @@ def create_train_val_datasets(df: pd.DataFrame, feature_cols: list,
         # maps back to the original df
         # For simplicity, store month in samples during dataset construction
         # Actually, let's filter by checking target availability and test flag
-        if not np.isnan(sample['target_kt']):
+        if not np.isnan(sample['target_delta_kt']):
             # We'll split by index later; for now collect all valid samples
             train_indices.append(i)
 

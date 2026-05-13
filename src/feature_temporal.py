@@ -239,6 +239,104 @@ def compute_temporal_features(df: pd.DataFrame,
             print(f"  Cumulative GHI exposure: log1p(cumsum/days)")
 
         # ----------------------------------------------------------
+        # 5.6. Causal EWMA Residual (kt_obs - kt_landsaf)
+        #      Tracks pyranometer drift.
+        #      CRITICAL: MUST shift by 1 to prevent data leakage!
+        #      In test set, radiation is NaN, so ffill propagates drift.
+        # ----------------------------------------------------------
+        if all(c in df.columns for c in ['radiation', 'clear_sky_ghi', 'kt_landsaf']):
+            # Compute kt_obs
+            # Avoid division by zero by clipping clear_sky_ghi to 10 W/m2 min
+            csi = np.maximum(df['clear_sky_ghi'].values, 10.0)
+            kt_obs = df['radiation'].values / csi
+            # Limit kt_obs to physical bounds to prevent wild EWMA spikes
+            kt_obs = np.clip(kt_obs, 0, 1.2)
+            
+            # Residual (Observed Transmissivity - Satellite Transmissivity)
+            residual = kt_obs - df['kt_landsaf'].values
+            
+            # Create a Series with station multi-index for safe shifting and EWMA
+            res_series = pd.Series(residual, index=df.index)
+            
+            # In Test set (where radiation is NaN), ffill will carry the last known drift forward
+            # This perfectly models constant sensor drift for the unseen month
+            causal_residual = df.groupby('station', group_keys=False).apply(
+                lambda g: res_series.loc[g.index].ffill().shift(1)
+            )
+            
+            # Compute EWMA on the strictly causal, forward-filled residual
+            # Span=672 (1 week) to capture slow drift
+            ewma_residual = df.groupby('station', group_keys=False).apply(
+                lambda g: causal_residual.loc[g.index].ewm(span=672, ignore_na=True).mean()
+            )
+            
+            new_columns['ewma_residual_kt'] = ewma_residual.fillna(0).astype(DTYPE)
+            print("  Causal EWMA Residual (kt) computed.")
+
+        # ----------------------------------------------------------
+        # 6. Cloud Motion Proxies (Advection)
+        #    Advection = -(u * dKt/dx + v * dKt/dy)
+        #    Requires KNN spatial gradients of kt_landsaf
+        # ----------------------------------------------------------
+        if all(c in df.columns for c in ['kt_landsaf', 'u10', 'v10', 'latitude', 'longitude']):
+            print("  Computing Cloud Motion Advection (KNN spatial gradients)...")
+            from sklearn.neighbors import NearestNeighbors
+            
+            # Pivot kt to compute cross-station gradients at each timestamp
+            kt_pivot = df.pivot(index='timestamp', columns='station', values='kt_landsaf')
+            stations = df[['station', 'latitude', 'longitude']].drop_duplicates().set_index('station')
+            station_names = stations.index.tolist()
+            
+            # Rough conversion to km (1 deg ~ 111 km)
+            X = stations['longitude'].values * 111.0
+            Y = stations['latitude'].values * 111.0
+            coords = np.column_stack((X, Y))
+            
+            K = min(5, len(station_names) - 1)
+            nbrs = NearestNeighbors(n_neighbors=K+1).fit(coords)
+            distances, indices = nbrs.kneighbors(coords)
+            
+            grad_x = np.zeros_like(kt_pivot.values)
+            grad_y = np.zeros_like(kt_pivot.values)
+            
+            for i, st in enumerate(station_names):
+                nb_idx = indices[i, 1:]
+                dX = X[nb_idx] - X[i]
+                dY = Y[nb_idx] - Y[i]
+                A = np.column_stack((dX, dY))
+                try:
+                    A_pinv = np.linalg.pinv(A)
+                except np.linalg.LinAlgError:
+                    A_pinv = np.zeros((2, K))
+                    
+                kt_i = kt_pivot.iloc[:, i].values
+                kt_nb = kt_pivot.iloc[:, nb_idx].values
+                dKt = kt_nb - kt_i[:, None]
+                
+                grad = dKt @ A_pinv.T
+                grad_x[:, i] = grad[:, 0]
+                grad_y[:, i] = grad[:, 1]
+                
+            grad_x_df = pd.DataFrame(grad_x, index=kt_pivot.index, columns=station_names)
+            grad_y_df = pd.DataFrame(grad_y, index=kt_pivot.index, columns=station_names)
+            
+            grad_x_melt = grad_x_df.reset_index().melt(id_vars='timestamp', value_name='grad_x', var_name='station')
+            grad_y_melt = grad_y_df.reset_index().melt(id_vars='timestamp', value_name='grad_y', var_name='station')
+            
+            # Merge back safely
+            # Since df is sorted by station, timestamp, we need to match the sorting or just merge
+            # Merging 1.3M rows takes a few seconds.
+            temp_merge = df[['timestamp', 'station']].merge(grad_x_melt, on=['timestamp', 'station'], how='left')
+            temp_merge = temp_merge.merge(grad_y_melt, on=['timestamp', 'station'], how='left')
+            
+            # Compute advection = - (u * dx + v * dy)
+            # u10 is eastward (positive x), v10 is northward (positive y)
+            new_columns['advection_kt'] = (
+                - (df['u10'].values * temp_merge['grad_x'].values + df['v10'].values * temp_merge['grad_y'].values)
+            ).astype(DTYPE)
+            print("  Cloud Advection computed.")
+
+        # ----------------------------------------------------------
         # Assign all new columns at once
         # ----------------------------------------------------------
         for col_name, col_values in new_columns.items():

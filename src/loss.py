@@ -43,17 +43,22 @@ class ZindiSolarLoss(nn.Module):
 
     def __init__(self, mbe_weight: float = 0.5, rmse_weight: float = 0.5,
                  night_penalty_weight: float = 0.01,
+                 delta_kt_weight: float = 10.0,
+                 station_bias_penalty: float = 0.01,
                  spike_kt_threshold: float = 0.7,
                  spike_weight: float = 3.0):
         super().__init__()
         self.mbe_weight = mbe_weight
         self.rmse_weight = rmse_weight
         self.night_penalty_weight = night_penalty_weight
+        self.delta_kt_weight = delta_kt_weight
+        self.station_bias_penalty = station_bias_penalty
         self.spike_kt_threshold = spike_kt_threshold
         self.spike_weight = spike_weight
 
     def forward(self, ghi_pred: torch.Tensor, ghi_target: torch.Tensor,
-                kt_pred: torch.Tensor = None, is_night: torch.Tensor = None):
+                delta_kt_pred: torch.Tensor = None, delta_kt_target: torch.Tensor = None,
+                is_night: torch.Tensor = None, station_bias: torch.Tensor = None):
         """
         Compute combined loss.
 
@@ -63,10 +68,14 @@ class ZindiSolarLoss(nn.Module):
             Predicted radiation in W/m2.
         ghi_target : Tensor (batch,)
             Target radiation in W/m2.
-        kt_pred : Tensor (batch,) or None
-            Predicted clearness index for spike-aware weighting.
+        delta_kt_pred : Tensor (batch,) or None
+            Predicted delta kt for auxiliary task.
+        delta_kt_target : Tensor (batch,) or None
+            Target delta kt for auxiliary task.
         is_night : Tensor (batch,) or None
             Nighttime flag for night penalty.
+        station_bias : Tensor (batch,) or None
+            Predicted station bias for L2 regularization.
 
         Returns
         -------
@@ -93,21 +102,26 @@ class ZindiSolarLoss(nn.Module):
         # Upweight errors during high-kt events where RMSE is dominated
         squared_errors = residuals ** 2
 
-        if kt_pred is not None and self.spike_weight > 1.0:
-            kt_valid = kt_pred[valid_mask]
-            weights = torch.where(
-                kt_valid > self.spike_kt_threshold,
-                torch.tensor(self.spike_weight, device=pred.device),
-                torch.tensor(1.0, device=pred.device),
-            )
-            weighted_mse = torch.mean(squared_errors * weights)
-        else:
-            weighted_mse = torch.mean(squared_errors)
+        weighted_mse = torch.mean(squared_errors)
 
         rmse = torch.sqrt(weighted_mse + 1e-8)
 
         # --- Combined primary loss ---
         primary_loss = self.mbe_weight * mbe + self.rmse_weight * rmse
+
+        # --- Auxiliary Delta Kt Loss ---
+        aux_loss = torch.tensor(0.0, device=ghi_pred.device)
+        if delta_kt_pred is not None and delta_kt_target is not None:
+            dkt_pred = delta_kt_pred[valid_mask]
+            dkt_target = delta_kt_target[valid_mask]
+            dkt_valid = ~torch.isnan(dkt_target)
+            if dkt_valid.sum() > 0:
+                aux_loss = self.delta_kt_weight * torch.mean((dkt_pred[dkt_valid] - dkt_target[dkt_valid])**2)
+
+        # --- Station Bias L2 Penalty ---
+        bias_loss = torch.tensor(0.0, device=ghi_pred.device)
+        if station_bias is not None:
+            bias_loss = self.station_bias_penalty * torch.mean(station_bias**2)
 
         # --- Night penalty (radiation should be zero at night) ---
         physics_loss = torch.tensor(0.0, device=ghi_pred.device)
@@ -118,7 +132,7 @@ class ZindiSolarLoss(nn.Module):
                 night_penalty = torch.mean(night_radiation ** 2)
                 physics_loss = physics_loss + self.night_penalty_weight * night_penalty
 
-        total_loss = primary_loss + physics_loss
+        total_loss = primary_loss + physics_loss + aux_loss + bias_loss
 
         # Unweighted RMSE for logging (matches Zindi metric exactly)
         raw_rmse = torch.sqrt(torch.mean(squared_errors) + 1e-8)
@@ -128,6 +142,8 @@ class ZindiSolarLoss(nn.Module):
             'mbe': torch.abs(mean_error).item(),
             'rmse': raw_rmse.item(),
             'physics': physics_loss.item(),
+            'aux_dkt': aux_loss.item(),
+            'bias_reg': bias_loss.item(),
             'zindi_score': (0.5 * torch.abs(mean_error) + 0.5 * raw_rmse).item(),
         }
 

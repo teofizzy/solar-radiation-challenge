@@ -11,8 +11,7 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, Subset
 
 from src.config import HPARAMS, PATHS, SEED, WANDB_CONFIG, seed_everything, ensure_dirs, get_n_stations
-from src.model_lstm import PhysicsInformedBiLSTM
-from src.model_attention import AttentionBiLSTM
+from src.model_lstm import PhysicsInformedCNNBiLSTM
 from src.loss import ZindiSolarLoss, compute_zindi_score
 from src.utils import timer, get_device, clean_memory
 
@@ -128,34 +127,19 @@ def train_model(dataset, feature_cols: list, val_months: list = None,
         pin_memory=False,
     )
 
-    # Model selection: AttentionBiLSTM (default) or PhysicsInformedBiLSTM (fallback)
+    # Model selection
     n_features = len(feature_cols)
     n_stations = get_n_stations()
 
-    use_attention = HPARAMS.get('use_attention', True)
-    if use_attention:
-        model = AttentionBiLSTM(
-            n_features=n_features,
-            n_stations=n_stations,
-            hidden_dim=HPARAMS['hidden_dim'],
-            n_layers=HPARAMS['n_layers'],
-            embed_dim=HPARAMS['embed_dim'],
-            dropout=HPARAMS['dropout'],
-            attn_dim=HPARAMS.get('attn_dim', 128),
-            attn_dropout=HPARAMS.get('attn_dropout', 0.10),
-            attn_temperature=HPARAMS.get('attn_temperature', 2.0),
-        ).to(device)
-        print(f"  Model: AttentionBiLSTM (Bahdanau attention, tau={HPARAMS.get('attn_temperature', 2.0)})")
-    else:
-        model = PhysicsInformedBiLSTM(
-            n_features=n_features,
-            n_stations=n_stations,
-            hidden_dim=HPARAMS['hidden_dim'],
-            n_layers=HPARAMS['n_layers'],
-            embed_dim=HPARAMS['embed_dim'],
-            dropout=HPARAMS['dropout'],
-        ).to(device)
-        print(f"  Model: PhysicsInformedBiLSTM (center-only)")
+    model = PhysicsInformedCNNBiLSTM(
+        n_features=n_features,
+        n_stations=n_stations,
+        hidden_dim=HPARAMS['hidden_dim'],
+        n_layers=HPARAMS['n_layers'],
+        embed_dim=HPARAMS['embed_dim'],
+        dropout=HPARAMS['dropout'],
+    ).to(device)
+    print(f"  Model: PhysicsInformedCNNBiLSTM (Delta kt)")
 
     print(f"  Model parameters: {sum(p.numel() for p in model.parameters()):,}")
 
@@ -228,13 +212,14 @@ def train_model(dataset, feature_cols: list, val_months: list = None,
             clear_sky = batch['clear_sky_ghi'].to(device)
             is_night = batch['is_night'].to(device)
             target_ghi = batch['target_ghi'].to(device)
-            target_kt = batch['target_kt'].to(device)
+            target_delta_kt = batch['target_delta_kt'].to(device)
+            center_kt_landsaf = batch['center_kt_landsaf'].to(device)
 
             optimizer.zero_grad(set_to_none=True)
 
             with torch.amp.autocast('cuda', enabled=(device.type == 'cuda')):
-                kt_pred, ghi_pred = model(x, station_idx, clear_sky, is_night)
-                loss, loss_dict = criterion(ghi_pred, target_ghi, kt_pred, is_night)
+                delta_kt_pred, ghi_pred, station_bias = model(x, station_idx, clear_sky, is_night, center_kt_landsaf)
+                loss, loss_dict = criterion(ghi_pred, target_ghi, delta_kt_pred, target_delta_kt, is_night, station_bias)
 
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
@@ -267,9 +252,10 @@ def train_model(dataset, feature_cols: list, val_months: list = None,
                 clear_sky = batch['clear_sky_ghi'].to(device)
                 is_night = batch['is_night'].to(device)
                 target_ghi = batch['target_ghi']
+                center_kt_landsaf = batch['center_kt_landsaf'].to(device)
 
                 with torch.amp.autocast('cuda', enabled=(device.type == 'cuda')):
-                    kt_pred, ghi_pred = model(x, station_idx, clear_sky, is_night)
+                    delta_kt_pred, ghi_pred, station_bias = model(x, station_idx, clear_sky, is_night, center_kt_landsaf)
 
                 val_preds.extend(ghi_pred.cpu().numpy())
                 val_targets.extend(target_ghi.numpy())

@@ -1,16 +1,18 @@
 """
-Physics-Informed BiLSTM for solar radiation reconstruction.
-Predicts clearness index kt in (0, 1), then reconstructs GHI = kt * clear_sky_ghi.
+Physics-Informed CNN-BiLSTM for solar radiation reconstruction.
+Predicts residual transmissivity (Delta kt), then reconstructs kt and GHI.
 
 Architecture:
     Input (batch, seq_len, n_features + embed_dim)
       -> LayerNorm
-      -> BiLSTM (2 layers, 128 hidden, bidirectional)
-      -> Center hidden state extraction (256-dim)
-      -> Linear(256, 64) -> GELU -> Dropout
-      -> Linear(64, 1) -> Sigmoid (kt in 0..1)
-      -> GHI = kt * clear_sky_ghi
-      -> Night gate: GHI * (1 - is_night)
+      -> Temporal 1D-CNN (Local Feature Extraction)
+      -> BiLSTM (2 layers, bidirectional)
+      -> Center-Query Additive Attention (Temporal Focus)
+      -> Global Head (Predicts Delta kt baseline)
+      + Station Bias Head (Predicts pyranometer drift/bias)
+      -> Delta kt = Global + Station Bias
+      -> kt_pred = center_kt_landsaf + Delta kt
+      -> GHI = kt_pred * clear_sky_ghi
 """
 
 import torch
@@ -19,39 +21,16 @@ import torch.nn as nn
 from src.config import HPARAMS
 
 
-class PhysicsInformedBiLSTM(nn.Module):
-    """
-    Bi-directional LSTM that predicts clearness index (kt) for solar radiation
-    reconstruction. Physics constraints are enforced via:
-      1. Sigmoid output: kt bounded in (0, 1)
-      2. Night gate: GHI forced to 0 when solar_zenith > 90
-      3. Station embedding: global model conditioned on station identity
-
-    Parameters
-    ----------
-    n_features : int
-        Number of input covariate features per timestep.
-    n_stations : int
-        Number of unique stations for embedding.
-    hidden_dim : int
-        LSTM hidden dimension (per direction).
-    n_layers : int
-        Number of LSTM layers.
-    embed_dim : int
-        Station embedding dimension.
-    dropout : float
-        Dropout rate.
-    """
-
+class PhysicsInformedCNNBiLSTM(nn.Module):
     def __init__(self, n_features: int, n_stations: int,
                  hidden_dim: int = None, n_layers: int = None,
                  embed_dim: int = None, dropout: float = None):
         super().__init__()
 
-        hidden_dim = hidden_dim or HPARAMS['hidden_dim']
-        n_layers = n_layers or HPARAMS['n_layers']
-        embed_dim = embed_dim or HPARAMS['embed_dim']
-        dropout = dropout or HPARAMS['dropout']
+        hidden_dim = hidden_dim or HPARAMS.get('hidden_dim', 128)
+        n_layers = n_layers or HPARAMS.get('n_layers', 2)
+        embed_dim = embed_dim or HPARAMS.get('embed_dim', 32)
+        dropout = dropout or HPARAMS.get('dropout', 0.2)
 
         self.hidden_dim = hidden_dim
         self.n_layers = n_layers
@@ -64,9 +43,17 @@ class PhysicsInformedBiLSTM(nn.Module):
         # Input normalization
         self.input_norm = nn.LayerNorm(n_features + embed_dim)
 
+        # 1D-CNN for transient feature extraction
+        self.cnn = nn.Sequential(
+            nn.Conv1d(in_channels=n_features + embed_dim, out_channels=hidden_dim, 
+                      kernel_size=5, padding=2),
+            nn.GELU(),
+            nn.Dropout(dropout)
+        )
+
         # Bidirectional LSTM
         self.bilstm = nn.LSTM(
-            input_size=n_features + embed_dim,
+            input_size=hidden_dim,
             hidden_size=hidden_dim,
             num_layers=n_layers,
             batch_first=True,
@@ -74,20 +61,32 @@ class PhysicsInformedBiLSTM(nn.Module):
             dropout=dropout if n_layers > 1 else 0.0,
         )
 
-        # Output head: predicts kt from center hidden state
-        # BiLSTM output dim = 2 * hidden_dim
-        self.output_head = nn.Sequential(
-            nn.Linear(hidden_dim * 2, hidden_dim // 2),
+        # Center-Query Additive Attention
+        self.attn_W_q = nn.Linear(hidden_dim * 2, hidden_dim * 2)
+        self.attn_W_k = nn.Linear(hidden_dim * 2, hidden_dim * 2)
+        self.attn_v = nn.Linear(hidden_dim * 2, 1)
+
+        # Global Head to predict Delta kt
+        self.global_head = nn.Sequential(
+            nn.Linear(hidden_dim * 2, hidden_dim),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(hidden_dim // 2, 1),
-            nn.Sigmoid(),  # kt in (0, 1)
+            nn.Linear(hidden_dim, 1),
+            nn.Tanh()  # bounds output to [-1, 1], we scale to [-1.2, 1.2] below
+        )
+
+        # Station Bias Head to predict pyranometer drift
+        self.station_bias_head = nn.Sequential(
+            nn.Linear(embed_dim, hidden_dim // 2),
+            nn.GELU(),
+            nn.Dropout(dropout), # strong regularization to prevent overfit
+            nn.Linear(hidden_dim // 2, 1)
         )
 
         self._init_weights()
 
     def _init_weights(self):
-        """Xavier initialization for linear layers, orthogonal for LSTM."""
+        """Orthogonal init for RNNs, Xavier for others."""
         for name, param in self.bilstm.named_parameters():
             if 'weight_ih' in name:
                 nn.init.xavier_uniform_(param)
@@ -96,59 +95,57 @@ class PhysicsInformedBiLSTM(nn.Module):
             elif 'bias' in name:
                 nn.init.zeros_(param)
 
-        for module in self.output_head:
-            if isinstance(module, nn.Linear):
-                nn.init.xavier_uniform_(module.weight)
-                nn.init.zeros_(module.bias)
-
     def forward(self, x: torch.Tensor, station_idx: torch.Tensor,
-                clear_sky_ghi: torch.Tensor, is_night: torch.Tensor):
-        """
-        Forward pass.
-
-        Parameters
-        ----------
-        x : Tensor (batch, seq_len, n_features)
-            Covariate window.
-        station_idx : Tensor (batch,)
-            Station index for embedding lookup.
-        clear_sky_ghi : Tensor (batch,)
-            Clear-sky GHI at center timestep.
-        is_night : Tensor (batch,)
-            Nighttime flag at center timestep (1=night).
-
-        Returns
-        -------
-        kt_pred : Tensor (batch, 1) -- predicted clearness index
-        ghi_pred : Tensor (batch, 1) -- predicted radiation (physics-gated)
-        """
+                clear_sky_ghi: torch.Tensor, is_night: torch.Tensor,
+                center_kt_landsaf: torch.Tensor):
+        
         batch_size, seq_len, _ = x.shape
 
-        # Station embedding: broadcast across sequence
+        # Embed station
         emb = self.station_embedding(station_idx)  # (batch, embed_dim)
-        emb = emb.unsqueeze(1).expand(-1, seq_len, -1)  # (batch, seq_len, embed_dim)
+        
+        # Station Bias
+        station_bias = self.station_bias_head(emb).squeeze(-1) # (batch,)
 
-        # Concatenate features + embedding
-        x = torch.cat([x, emb], dim=-1)  # (batch, seq_len, n_features + embed_dim)
-
-        # Layer normalization
+        # Broadcast embedding to sequence
+        emb_seq = emb.unsqueeze(1).expand(-1, seq_len, -1)
+        x = torch.cat([x, emb_seq], dim=-1)
         x = self.input_norm(x)
 
+        # CNN expects (batch, channels, seq_len)
+        x_cnn = x.transpose(1, 2)
+        x_cnn = self.cnn(x_cnn)
+        x_cnn = x_cnn.transpose(1, 2) # (batch, seq_len, hidden_dim)
+
         # BiLSTM
-        lstm_out, _ = self.bilstm(x)  # (batch, seq_len, 2*hidden_dim)
+        lstm_out, _ = self.bilstm(x_cnn)  # (batch, seq_len, 2*hidden_dim)
 
-        # Extract CENTER hidden state (not last -- symmetric window)
-        center_idx = self.half_window  # Index of center in the window
-        center_hidden = lstm_out[:, center_idx, :]  # (batch, 2*hidden_dim)
+        # Center-Query Attention
+        center_idx = self.half_window
+        query = lstm_out[:, center_idx, :].unsqueeze(1) # (batch, 1, 2*hidden_dim)
+        
+        # Energy
+        energy = self.attn_v(torch.tanh(self.attn_W_q(query) + self.attn_W_k(lstm_out))) # (batch, seq_len, 1)
+        attention = torch.softmax(energy, dim=1)
+        context = torch.sum(attention * lstm_out, dim=1) # (batch, 2*hidden_dim)
 
-        # Predict clearness index
-        kt_pred = self.output_head(center_hidden)  # (batch, 1)
+        # Global Delta Kt (scaled to [-1.2, 1.2])
+        global_delta_kt = self.global_head(context).squeeze(-1) * 1.2
+        
+        # Final Delta Kt = Global + Bias
+        delta_kt_pred = global_delta_kt + station_bias
 
-        # Reconstruct GHI: kt * clear_sky_ghi
-        ghi_pred = kt_pred.squeeze(-1) * clear_sky_ghi  # (batch,)
+        # Reconstruct Kt
+        kt_pred = center_kt_landsaf + delta_kt_pred
+        
+        # Force strict physical bounds [0, 1.2]
+        kt_pred = torch.clamp(kt_pred, 0.0, 1.2)
+
+        # Reconstruct GHI
+        ghi_pred = kt_pred * clear_sky_ghi
 
         # Night gate: force GHI = 0 at night
-        day_mask = 1.0 - is_night  # 0 at night, 1 during day
-        ghi_pred = ghi_pred * day_mask  # (batch,)
+        day_mask = 1.0 - is_night
+        ghi_pred = ghi_pred * day_mask
 
-        return kt_pred.squeeze(-1), ghi_pred
+        return delta_kt_pred, ghi_pred, station_bias
