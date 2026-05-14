@@ -53,16 +53,33 @@ def extract_era5_for_station(ds, station_id: str, lat: float, lon: float,
     -------
     pd.DataFrame with ERA5 variables at 15-minute cadence.
     """
-    # 1. Coordinate normalization (longitude wrap-around 0-360)
-    lon = lon % 360
+    # 1. Robust Longitude Normalization
+    # Detect convention: [0, 360] vs [-180, 180]
+    ds_lon_min = float(ds.longitude.min())
+    ds_lon_max = float(ds.longitude.max())
     
+    if ds_lon_min >= 0 and lon < 0:
+        # Dataset is 0..360, point is -180..180 -> shift point to 0..360
+        lon = lon % 360
+    elif ds_lon_max <= 180 and lon > 180:
+        # Dataset is -180..180, point is 0..360 -> shift point to -180..180
+        lon = (lon + 180) % 360 - 180
+
     # 2. Standardize naming
     ds = fix_coords(ds)
     
     # 3. Extract nearest grid point (bilinear interpolation)
     # Use method='linear' for smoothness, but nearest fallback if interp fails
     try:
-        ds_point = ds.interp(latitude=lat, longitude=lon, method='linear')
+        # Ensure we are within bounds to avoid interp NaNs
+        lat_min, lat_max = float(ds.latitude.min()), float(ds.latitude.max())
+        lon_min, lon_max = float(ds.longitude.min()), float(ds.longitude.max())
+        
+        # Clip to bounds slightly to avoid edge NaNs
+        lat_query = np.clip(lat, lat_min + 0.01, lat_max - 0.01)
+        lon_query = np.clip(lon, lon_min + 0.01, lon_max - 0.01)
+        
+        ds_point = ds.interp(latitude=lat_query, longitude=lon_query, method='linear')
     except Exception as e:
         print(f"  [FEATURE_ERA5] Interpolation failed for {station_id}: {e}. Falling back to nearest.")
         ds_point = ds.sel(latitude=lat, longitude=lon, method='nearest')
@@ -193,13 +210,15 @@ def compute_era5_features(df: pd.DataFrame,
             ds = xr.open_mfdataset(nc_files, combine='by_coords',
                                    chunks={'time': 100})
             
-            # Diagnostic for coordinate ranges
+            # Diagnostic for coordinate and time ranges
             if 'latitude' in ds.coords or 'lat' in ds.coords:
                 temp_ds = fix_coords(ds)
                 lat_min, lat_max = float(temp_ds.latitude.min()), float(temp_ds.latitude.max())
                 lon_min, lon_max = float(temp_ds.longitude.min()), float(temp_ds.longitude.max())
+                t_min, t_max = pd.to_datetime(ds.time.min().values), pd.to_datetime(ds.time.max().values)
                 print(f"  [FEATURE_ERA5] Bounds: Lat=[{lat_min:.2f}, {lat_max:.2f}], "
                       f"Lon=[{lon_min:.2f}, {lon_max:.2f}]")
+                print(f"  [FEATURE_ERA5] Time: {t_min} to {t_max}")
 
             # Handle expver dimension
             if 'expver' in ds.dims:

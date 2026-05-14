@@ -52,7 +52,7 @@ elif IS_KAGGLE:
         # Fallback to current working directory
         LOCAL_DATA_DIR = os.getcwd()
 else:
-    PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    PROJECT_DIR = os.path.join(os.environ.get("SCRATCH"), "challenges/zindi/solar-radiation-challenge")
     LOCAL_DATA_DIR = os.path.join(PROJECT_DIR, 'data')
 
 PATHS = {
@@ -65,10 +65,10 @@ PATHS = {
     'sample_submission': os.path.join(LOCAL_DATA_DIR, 'SampleSubmission.csv'),
 
     # Drive paths for satellite data (Colab only)
-    'mdssf_csv': os.path.join(PROJECT_DIR, 'mdssf.csv'),
-    'mlst_csv': os.path.join(PROJECT_DIR, 'mlst.csv'),
-    'tropomi_aerosol_dir': os.path.join(PROJECT_DIR, 'TROPOMI_Optimized_Aerosol'),
-    'tropomi_cloud_dir': os.path.join(PROJECT_DIR, 'TROPOMI_Optimized_Cloud'),
+    'mdssf_csv': os.path.join(LOCAL_DATA_DIR, 'mdssf.csv'),
+    'mlst_csv': os.path.join(LOCAL_DATA_DIR, 'mlst.csv'),
+    'tropomi_aerosol_dir': os.path.join(LOCAL_DATA_DIR, 'TROPOMI_Optimized_Aerosol'),
+    'tropomi_cloud_dir': os.path.join(LOCAL_DATA_DIR, 'TROPOMI_Optimized_Cloud'),
 
     # Cache directories (feature engineering outputs)
     'cache_dir': os.path.join(PROJECT_DIR if IS_COLAB else PROJECT_DIR, 'cache'),
