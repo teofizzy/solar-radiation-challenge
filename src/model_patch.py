@@ -76,7 +76,12 @@ class PhysicsInformedPatchTransformer(nn.Module):
         self.register_buffer('topo_bias', self._load_topo_bias(n_stations))
         self.topo_scale = nn.Parameter(torch.ones(1) * 0.1) # Learnable scale
         
-        # 7. Fusion & Output Heads
+        # 7. Logit Scale (Temperature) for Cosine Attention
+        # Bounds cosine similarity [-1, 1] to a broader range before softmax.
+        # Initialize at log(10) ~ 2.3
+        self.logit_scale = nn.Parameter(torch.ones([]) * np.log(10.0))
+        
+        # 8. Fusion & Output Heads
         self.fusion = nn.Linear(d_model + 32, d_model)
         
         # Multi-task head: [delta_kt, raw_ghi_correction]
@@ -121,32 +126,38 @@ class PhysicsInformedPatchTransformer(nn.Module):
         x = self.transformer(x) # (B, n_patches, d_model)
         
         # 2. Multi-Token Pooling (Preserve advection phase)
-        # Keep 4 central tokens instead of just 1
+        # Keep up to 4 central tokens. Dynamic clamp for stability across hparam variations.
         n_p = x.shape[1]
         mid = n_p // 2
-        z_temp = x[:, mid-2:mid+2, :] # (B, 4, d_model)
+        start_idx = max(0, mid - 2)
+        end_idx = min(n_p, mid + 2)
+        z_temp = x[:, start_idx:end_idx, :] # (B, tokens, d_model)
         
         # 3. Diagnostic Embedding
         z_diag = self.diag_encoder(diag_vector) # (B, 32)
         
-        # Spatial Attention (Cosine Similarity formulation for numerical stability)
-        # query: (B, 4, d_model), key/value: (B, 40, d_model)
-        # Normalizing query and key converts matmul to cosine similarity, bounding logits.
+        # query: (B, tokens, d_model), key/value: (B, 40, d_model)
+        # Normalizing query and key converts matmul to cosine similarity.
         query = F.normalize(z_temp, dim=-1) 
         key = F.normalize(self.station_memory, dim=-1).unsqueeze(0).expand(B, -1, -1) 
         
-        # Topographic Bias: scale is learnable
-        bias_mask = (self.topo_bias[station_idx] * self.topo_scale).unsqueeze(1) # (B, 1, 40)
-        
-        # scores: (B, 4, 40)
+        # scores: (B, tokens, 40)
+        # Cosine similarity is in [-1, 1]. Scaling expands range for selective attention.
         scores = torch.matmul(query, key.transpose(-2, -1))
-        scores = scores + bias_mask # Add Topographic Bias (broadcasts over 4 tokens)
+        
+        # Scale logits with learnable temperature
+        logit_scale_exp = self.logit_scale.exp().clamp(max=100.0)
+        scores = scores * logit_scale_exp
+        
+        # Topographic Bias: scale is learnable. (B, 1, 40)
+        bias_mask = (self.topo_bias[station_idx] * self.topo_scale).unsqueeze(1)
+        scores = scores + bias_mask
         
         # Logit clamping prevents softmax saturation and INF gradients in AMP
         scores = torch.clamp(scores, min=-20, max=20)
         
-        attn_weights = torch.softmax(scores, dim=-1)
-        z_spatial = torch.matmul(attn_weights, key) # (B, 4, d_model)
+        attn_weights = torch.softmax(scores, dim=-1) # (B, tokens, 40)
+        z_spatial = torch.matmul(attn_weights, key) # (B, tokens, d_model)
         
         # Pool spatial tokens to 1
         z_spatial = z_spatial.mean(dim=1) # (B, d_model)

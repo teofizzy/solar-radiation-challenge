@@ -205,7 +205,9 @@ def compute_refined_ranges(project_name: str, entity: str, top_k: int = 10, api_
     path = f"{entity}/{project_name}" if entity else project_name
     
     try:
-        runs = api.runs(path, order="+summary_metrics.val/zindi_score")
+        # Use server-side filtering to avoid fetching thousands of failed runs
+        filters = {"summary_metrics.val/zindi_score": {"$exists": True}}
+        runs = api.runs(path, filters=filters, order="+summary_metrics.val/zindi_score")
     except Exception as e:
         print(f"[REFINE] Failed to query W&B API: {e}")
         return None
@@ -234,8 +236,8 @@ def compute_refined_ranges(project_name: str, entity: str, top_k: int = 10, api_
     top_runs = valid_runs[:top_k]
     
     print(f"[REFINE] Analyzing top {len(top_runs)} runs...")
-    print(f"  Best score: {top_runs[0].summary['val/zindi_score']:.4f}")
-    print(f"  Worst in top-K: {top_runs[-1].summary['val/zindi_score']:.4f}")
+    print(f"  Best score: {float(top_runs[0].summary['val/zindi_score']):.4f}")
+    print(f"  Worst in top-K: {float(top_runs[-1].summary['val/zindi_score']):.4f}")
     
     refined = {}
     
@@ -369,7 +371,7 @@ def start_sweep(resume_id: str = None, refine: bool = False, count: int = 40, ap
         print(f"[SWEEP] Joining EXISTING sweep ID: {final_sweep_id}")
 
     # Start the agent
-    wandb.agent(final_sweep_id, function=run_sweep, count=args.count)
+    wandb.agent(final_sweep_id, function=run_sweep_agent, count=args.count)
     print("[SWEEP] Sweep completed.")
     
     # Print final global best

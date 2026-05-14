@@ -225,22 +225,28 @@ def train_model_ddp(dataset, feature_cols: list, val_months: list = None,
         dist.all_reduce(val_mbe_sum, op=dist.ReduceOp.SUM)
         dist.all_reduce(val_mse_sum, op=dist.ReduceOp.SUM)
         dist.all_reduce(val_count, op=dist.ReduceOp.SUM)
-
         if val_count > 0:
             val_mbe = torch.abs(val_mbe_sum / val_count).item()
             val_rmse = torch.sqrt(val_mse_sum / val_count).item()
             val_zindi = 0.5 * val_mbe + 0.5 * val_rmse
         else:
-            val_zindi = float('inf')
+            val_mbe = val_rmse = val_zindi = float('nan')
 
         if is_main:
-            print(f"Epoch {epoch+1:3d} | Train: {avg_train_loss:.4f} | Val Zindi: {val_zindi:.2f}")
+            print(f"Epoch {epoch+1:3d} | Train: {avg_train_loss:.4f} | Val Zindi: {val_zindi:.2f} (MBE: {val_mbe:.2f}, RMSE: {val_rmse:.2f})")
             if use_wandb and wandb is not None:
-                wandb.log({'epoch': epoch+1, 'train/loss': avg_train_loss, 'val/zindi': val_zindi})
+                wandb.log({
+                    'epoch': epoch+1, 
+                    'train/loss': avg_train_loss, 
+                    'val/mbe': val_mbe,
+                    'val/rmse': val_rmse,
+                    'val/zindi_score': val_zindi
+                })
 
-            if val_zindi < best_val_score:
+            if not np.isnan(val_zindi) and val_zindi < best_val_score:
                 best_val_score = val_zindi
                 torch.save(model.module.state_dict(), os.path.join(model_save_dir, 'best_model.pt'))
+                print(f"  [DDP] New best model saved (Score: {best_val_score:.4f})")
 
     cleanup_ddp()
     return None
