@@ -196,14 +196,12 @@ def run_sweep_agent(config=None):
 # ------------------------------------------------------------------
 # Cross-Sweep Learning: Refine Ranges from Prior Runs
 # ------------------------------------------------------------------
-def compute_refined_ranges(project_name: str, entity: str, top_k: int = 10):
+def compute_refined_ranges(project_name: str, entity: str, top_k: int = 10, api_key: str = None):
     """
     Query W&B API for top-K runs and compute narrowed hyperparameter ranges.
-    
-    Returns a dict of parameter -> {'min': float, 'max': float} for continuous
-    params, or {'values': list} for categorical params.
     """
-    api = wandb.Api()
+    # Explicitly pass api_key to the API interface
+    api = wandb.Api(api_key=api_key) if api_key else wandb.Api()
     path = f"{entity}/{project_name}" if entity else project_name
     
     try:
@@ -305,7 +303,7 @@ def get_default_sweep_config():
     }
 
 
-def start_sweep(resume_id: str = None, refine: bool = False, count: int = 40):
+def start_sweep(resume_id: str = None, refine: bool = False, count: int = 40, api_key: str = None):
     """
     Launch a sweep with one of three modes:
     
@@ -325,7 +323,8 @@ def start_sweep(resume_id: str = None, refine: bool = False, count: int = 40):
         refined = compute_refined_ranges(
             WANDB_CONFIG['project'],
             WANDB_CONFIG.get('entity'),
-            top_k=10
+            top_k=10,
+            api_key=api_key
         )
         
         if refined is None:
@@ -411,4 +410,4 @@ if __name__ == '__main__':
         if os.environ.get('WANDB_MODE') != 'disabled':
             print("[SWEEP] Check your ~/.netrc or WANDB_API_KEY environment variable.")
     
-    start_sweep(resume_id=args.resume, refine=args.refine, count=args.count)
+    start_sweep(resume_id=args.resume, refine=args.refine, count=args.count, api_key=api_key)
