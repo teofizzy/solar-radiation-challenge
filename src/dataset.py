@@ -12,8 +12,13 @@ Key design decisions:
 import os
 import numpy as np
 import pandas as pd
-import torch
-from torch.utils.data import Dataset
+try:
+    import torch
+    from torch.utils.data import Dataset
+    HAS_TORCH = True
+except ImportError:
+    HAS_TORCH = False
+    class Dataset: pass # Dummy for type checking
 
 from src.config import HPARAMS, DTYPE, PATHS, DIAGNOSTIC_FEATURES
 
@@ -21,8 +26,8 @@ from src.config import HPARAMS, DTYPE, PATHS, DIAGNOSTIC_FEATURES
 # Feature columns used as model input (ORDER MATTERS -- must be consistent)
 ASTRO_FEATURES = ['cos_zenith', 'csghi_terrain_corr']
 
-# ERA5: Use terrain-corrected versions (lapse rate, hypsometry)
-ERA5_FEATURES = ['u10', 'v10', 't_lapse_corr', 'p_hyps_corr', 'tco3', 'tcwv']
+# ERA5: Use terrain-corrected versions (lapse rate, hypsometry) + missing flag
+ERA5_FEATURES = ['u10', 'v10', 't_lapse_corr', 'p_hyps_corr', 'tco3', 'tcwv', 'era5_missing']
 
 PHYSICS_FEATURES = [
     'wind_direction_sin', 'wind_direction_cos',

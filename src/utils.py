@@ -164,34 +164,49 @@ def clean_memory():
         pass
 
 
-def enforce_schema(df: pd.DataFrame) -> pd.DataFrame:
+def enforce_schema(df: pd.DataFrame, source_name: str = "unknown") -> pd.DataFrame:
     """
-    Ensure 'timestamp' is a column and correctly typed across all pipeline stages.
-    Enforces canonical naming and avoids index-vs-column confusion.
+    Standardize 'timestamp' column and station types.
+    Resilient to index-vs-column placement and common weather data synonyms.
     """
+    if df is None:
+        return pd.DataFrame(columns=['timestamp'])
+        
     df = df.copy()
     
-    # 1. Handle timestamp in index
-    if df.index.name == "timestamp" or "timestamp" not in df.columns:
-        df = df.reset_index()
+    # 1. Handle Empty DataFrame
+    if len(df) == 0:
+        if 'timestamp' not in df.columns:
+            df['timestamp'] = pd.Series(dtype='datetime64[ns]')
+        return df[['timestamp']]
+
+    # 2. Check Index if timestamp not in columns
+    if 'timestamp' not in df.columns:
+        # If index is DatetimeIndex or has a known name
+        if isinstance(df.index, pd.DatetimeIndex) or df.index.name in ['timestamp', 'time', 'valid_time', 'index']:
+            df = df.reset_index()
+            # If it was named 'index' after reset, rename it
+            if 'index' in df.columns and 'timestamp' not in df.columns:
+                df = df.rename(columns={'index': 'timestamp'})
         
-    # 2. Ensure column exists (might have been named 'time' or 'valid_time')
-    if "timestamp" not in df.columns:
-        # Check for synonyms
-        synonyms = ["time", "valid_time", "Datetime", "date"]
+    # 3. Check Synonyms
+    if 'timestamp' not in df.columns:
+        synonyms = ['time', 'valid_time', 'forecast_time', 'Datetime', 'date']
         for syn in synonyms:
             if syn in df.columns:
-                df = df.rename(columns={syn: "timestamp"})
+                df = df.rename(columns={syn: 'timestamp'})
                 break
-                
-    if "timestamp" not in df.columns:
-        raise KeyError("Could not find 'timestamp' or suitable synonym in DataFrame columns.")
 
-    # 3. Canonical conversion
-    df["timestamp"] = pd.to_datetime(df["timestamp"]).dt.tz_localize(None)
+    # 4. Final Verification
+    if 'timestamp' not in df.columns:
+        raise KeyError(f"[{source_name}] Could not find 'timestamp' or suitable synonym. "
+                       f"Columns: {list(df.columns)}, Index Name: {df.index.name}")
+
+    # 5. Canonical Conversion (Remove timezone, force datetime64[ns])
+    df['timestamp'] = pd.to_datetime(df['timestamp']).dt.tz_localize(None)
     
-    # 4. Standardize station names/types if present
-    if "station" in df.columns:
-        df["station"] = df["station"].astype(str)
+    # 6. Standardize Station (if present)
+    if 'station' in df.columns:
+        df['station'] = df['station'].astype(str)
         
     return df
