@@ -258,8 +258,16 @@ def compute_era5_features(df: pd.DataFrame,
                     PATHS['cache_era5'], f'{station_id}_{year}.parquet')
 
                 if os.path.exists(cache_path) and not force_recompute:
-                    all_era5_dfs.append(pd.read_parquet(cache_path))
-                    continue
+                    cached_df = pd.read_parquet(cache_path)
+                    # Recovery: Parquet sometimes loses the column name or saves as index
+                    from src.utils import enforce_schema
+                    try:
+                        cached_df = enforce_schema(cached_df, source_name=f"ERA5_CACHE_{station_id}_{year}")
+                        all_era5_dfs.append(cached_df)
+                        continue
+                    except Exception as e:
+                        print(f"  [FEATURE_ERA5] Cache corrupted for {station_id}_{year}: {e}. Recomputing...")
+                        # Fall through to recompute
 
                 # Get station coordinates
                 st_mask = (df['station'] == station_id) & (df['year'] == year)
@@ -296,8 +304,8 @@ def compute_era5_features(df: pd.DataFrame,
             
             # ENSURE SCHEMA BEFORE MERGE (Critical Fix)
             from src.utils import enforce_schema
-            df_era5 = enforce_schema(df_era5)
-            df = enforce_schema(df)
+            df_era5 = enforce_schema(df_era5, source_name="ERA5_CONCAT")
+            df = enforce_schema(df, source_name="MAIN_PIPELINE")
 
             # Merge on station + timestamp
             era5_merge_cols = ['station', 'timestamp'] + \

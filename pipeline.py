@@ -166,7 +166,7 @@ def build_pipeline_data():
     print("=" * 70)
 
     # FINAL SCHEMA ENFORCEMENT
-    df = enforce_schema(df)
+    df = enforce_schema(df, source_name="FINAL_PIPELINE_OUTPUT")
     
     feature_cols = get_feature_columns(df)
     print(f"  Feature columns ({len(feature_cols)}): {feature_cols}")

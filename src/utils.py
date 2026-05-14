@@ -183,15 +183,17 @@ def enforce_schema(df: pd.DataFrame, source_name: str = "unknown") -> pd.DataFra
     # 2. Check Index if timestamp not in columns
     if 'timestamp' not in df.columns:
         # If index is DatetimeIndex or has a known name
-        if isinstance(df.index, pd.DatetimeIndex) or df.index.name in ['timestamp', 'time', 'valid_time', 'index']:
+        if isinstance(df.index, pd.DatetimeIndex) or df.index.name in ['timestamp', 'time', 'valid_time', 'Datetime', 'index']:
             df = df.reset_index()
-            # If it was named 'index' after reset, rename it
-            if 'index' in df.columns and 'timestamp' not in df.columns:
-                df = df.rename(columns={'index': 'timestamp'})
+            # If reset_index created 'index' or the old name, find it
+            for col in ['index', 'time', 'valid_time', 'Datetime']:
+                if col in df.columns and 'timestamp' not in df.columns:
+                    df = df.rename(columns={col: 'timestamp'})
+                    break
         
-    # 3. Check Synonyms
+    # 3. Check Synonyms in columns
     if 'timestamp' not in df.columns:
-        synonyms = ['time', 'valid_time', 'forecast_time', 'Datetime', 'date']
+        synonyms = ['time', 'valid_time', 'forecast_time', 'Datetime', 'date', 'dt']
         for syn in synonyms:
             if syn in df.columns:
                 df = df.rename(columns={syn: 'timestamp'})
@@ -199,8 +201,11 @@ def enforce_schema(df: pd.DataFrame, source_name: str = "unknown") -> pd.DataFra
 
     # 4. Final Verification
     if 'timestamp' not in df.columns:
-        raise KeyError(f"[{source_name}] Could not find 'timestamp' or suitable synonym. "
-                       f"Columns: {list(df.columns)}, Index Name: {df.index.name}")
+        cols_str = list(df.columns)
+        idx_str = str(df.index.name) if df.index.name else "None"
+        raise KeyError(f"[{source_name}] Schema Failure: Missing 'timestamp'. "
+                       f"Found Cols: {cols_str}, Index: {idx_str}. "
+                       f"DataFrame is type {type(df.index)} with length {len(df)}")
 
     # 5. Canonical Conversion (Remove timezone, force datetime64[ns])
     df['timestamp'] = pd.to_datetime(df['timestamp']).dt.tz_localize(None)
