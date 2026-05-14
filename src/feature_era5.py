@@ -16,6 +16,23 @@ from src.config import PATHS, ERA5_VARS, DTYPE, ensure_dirs
 from src.utils import timer, reduce_mem_usage, validate_no_nan, clean_memory
 
 
+def fix_coords(ds: xr.Dataset) -> xr.Dataset:
+    """
+    Standardize coordinate names to 'latitude' and 'longitude'.
+    Some ERA5 datasets use 'lat'/'lon'.
+    """
+    rename_map = {}
+    if 'lat' in ds.coords and 'latitude' not in ds.coords:
+        rename_map['lat'] = 'latitude'
+    if 'lon' in ds.coords and 'longitude' not in ds.coords:
+        rename_map['lon'] = 'longitude'
+    
+    if rename_map:
+        print(f"  [FEATURE_ERA5] Renaming coordinates: {rename_map}")
+        return ds.rename(rename_map)
+    return ds
+
+
 def extract_era5_for_station(ds, station_id: str, lat: float, lon: float,
                              target_timestamps: pd.Series) -> pd.DataFrame:
     """
@@ -36,8 +53,19 @@ def extract_era5_for_station(ds, station_id: str, lat: float, lon: float,
     -------
     pd.DataFrame with ERA5 variables at 15-minute cadence.
     """
-    # Extract nearest grid point (bilinear interpolation)
-    ds_point = ds.interp(latitude=lat, longitude=lon, method='linear')
+    # 1. Coordinate normalization (longitude wrap-around 0-360)
+    lon = lon % 360
+    
+    # 2. Standardize naming
+    ds = fix_coords(ds)
+    
+    # 3. Extract nearest grid point (bilinear interpolation)
+    # Use method='linear' for smoothness, but nearest fallback if interp fails
+    try:
+        ds_point = ds.interp(latitude=lat, longitude=lon, method='linear')
+    except Exception as e:
+        print(f"  [FEATURE_ERA5] Interpolation failed for {station_id}: {e}. Falling back to nearest.")
+        ds_point = ds.sel(latitude=lat, longitude=lon, method='nearest')
 
     # Select only the variables we need
     available_vars = [v for v in ERA5_VARS if v in ds_point.data_vars]
@@ -164,6 +192,14 @@ def compute_era5_features(df: pd.DataFrame,
 
             ds = xr.open_mfdataset(nc_files, combine='by_coords',
                                    chunks={'time': 100})
+            
+            # Diagnostic for coordinate ranges
+            if 'latitude' in ds.coords or 'lat' in ds.coords:
+                temp_ds = fix_coords(ds)
+                lat_min, lat_max = float(temp_ds.latitude.min()), float(temp_ds.latitude.max())
+                lon_min, lon_max = float(temp_ds.longitude.min()), float(temp_ds.longitude.max())
+                print(f"  [FEATURE_ERA5] Bounds: Lat=[{lat_min:.2f}, {lat_max:.2f}], "
+                      f"Lon=[{lon_min:.2f}, {lon_max:.2f}]")
 
             # Handle expver dimension
             if 'expver' in ds.dims:

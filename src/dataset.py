@@ -19,18 +19,17 @@ from src.config import HPARAMS, DTYPE, PATHS, DIAGNOSTIC_FEATURES
 
 
 # Feature columns used as model input (ORDER MATTERS -- must be consistent)
-ASTRO_FEATURES = ['cos_zenith', 'solar_zenith', 'csghi_terrain_corr', 'log_clearsky_ghi']
+ASTRO_FEATURES = ['cos_zenith', 'csghi_terrain_corr']
 
 # ERA5: Use terrain-corrected versions (lapse rate, hypsometry)
 ERA5_FEATURES = ['u10', 'v10', 't_lapse_corr', 'p_hyps_corr', 'tco3', 'tcwv']
 
 PHYSICS_FEATURES = [
-    'air_mass', 'wind_speed', 'log_wind_speed',
     'wind_direction_sin', 'wind_direction_cos',
     'dewpoint_depression', 'pw_attenuation', 'turbidity_proxy',
     'hour_sin', 'hour_cos', 'hour_12_sin', 'hour_12_cos', 
-    'hour_6_sin', 'hour_6_cos', 'hour_3_sin', 'hour_3_cos',
-    'month_sin', 'month_cos', 'doy_sin', 'doy_cos', 'days_since_start',
+    'hour_6_sin', 'hour_6_cos',
+    'doy_sin', 'doy_cos', 'days_since_start',
     'csghi_terrain_corr'
 ]
 
@@ -71,8 +70,8 @@ def get_feature_columns(df: pd.DataFrame) -> list:
     lag_cols = [c for c in df.columns if '_lag_' in c]
     candidates += sorted(lag_cols)
 
-    # Add EWMA drift features
-    ewma_cols = [c for c in df.columns if c.startswith('ewma_kt_') or
+    # Add EWMA drift features (exclude raw fast/slow components as redundant with drift_proxy)
+    ewma_cols = [c for c in df.columns if (c.startswith('ewma_kt_') and c not in ['ewma_kt_fast', 'ewma_kt_slow']) or
                  c in ('drift_proxy', 'log_cum_exposure', 'clearness_regime_shift')]
     candidates += sorted(ewma_cols)
 

@@ -193,12 +193,24 @@ def compute_physics_features(df: pd.DataFrame,
 
         # ----------------------------------------------------------
         # 6. Cyclical time encoding (sin/cos)
-        # ----------------------------------------------------------
+        # Higher frequencies (12h, 6h, 3h) help the Transformer capture sharp diurnal transitions
         hour_frac = df['hour'].values + df['minute'].values / 60.0
         df['hour_sin'] = np.sin(2 * np.pi * hour_frac / 24.0).astype(DTYPE)
         df['hour_cos'] = np.cos(2 * np.pi * hour_frac / 24.0).astype(DTYPE)
         
-        # Monthly encoding pruned as DOY is more continuous
+        df['hour_12_sin'] = np.sin(2 * np.pi * hour_frac / 12.0).astype(DTYPE)
+        df['hour_12_cos'] = np.cos(2 * np.pi * hour_frac / 12.0).astype(DTYPE)
+        
+        df['hour_6_sin'] = np.sin(2 * np.pi * hour_frac / 6.0).astype(DTYPE)
+        df['hour_6_cos'] = np.cos(2 * np.pi * hour_frac / 6.0).astype(DTYPE)
+        
+        df['hour_3_sin'] = np.sin(2 * np.pi * hour_frac / 3.0).astype(DTYPE)
+        df['hour_3_cos'] = np.cos(2 * np.pi * hour_frac / 3.0).astype(DTYPE)
+
+        # Seasonal encoding: Monthly and Day-of-Year
+        month = df['month'].values.astype(np.float32)
+        df['month_sin'] = np.sin(2 * np.pi * (month - 1) / 12.0).astype(DTYPE)
+        df['month_cos'] = np.cos(2 * np.pi * (month - 1) / 12.0).astype(DTYPE)
 
         doy = df['dayofyear'].values.astype(np.float32)
         df['doy_sin'] = np.sin(2 * np.pi * doy / 365.25).astype(DTYPE)
