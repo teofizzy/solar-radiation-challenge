@@ -52,6 +52,9 @@ def compute_static_features(df: pd.DataFrame, force_recompute: bool = False) -> 
         # Temporary storage for per-station features
         station_features = []
         
+        if 'station' not in station_meta.columns:
+            station_meta = station_meta.reset_index()
+            
         for _, row in station_meta.iterrows():
             st_id = row['station']
             lat, lon = row['latitude'], row['longitude']
@@ -64,7 +67,11 @@ def compute_static_features(df: pd.DataFrame, force_recompute: bool = False) -> 
             dem = float(point_cont.dem.values) if 'dem' in ds else np.nan
             slope = float(point_cont.Slope.values) if 'Slope' in ds else np.nan
             aspect = float(point_cont.Aspect.values) if 'Aspect' in ds else np.nan
-            land_cover = int(point_near.LandCover.values) if 'LandCover' in ds else -1
+            
+            # Robust categorical extraction
+            lc_val = point_near.LandCover.values if 'LandCover' in ds else np.nan
+            land_cover = int(lc_val) if not np.isnan(lc_val) else -1
+            
             dist_water = float(point_cont.DistanceToWater.values) if 'DistanceToWater' in ds else np.nan
             tpi = float(point_cont.TPI_2000M.values) if 'TPI_2000M' in ds else np.nan
             std = float(point_cont.STD_2000M.values) if 'STD_2000M' in ds else np.nan

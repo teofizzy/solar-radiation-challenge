@@ -5,7 +5,7 @@ import torch.nn.functional as F
 import numpy as np
 import os
 
-from src.config import MODEL_PARAMS
+from src.config import HPARAMS
 
 class DiagnosticEncoder(nn.Module):
     """Encodes static diagnostic descriptors into a latent vector."""
@@ -58,7 +58,7 @@ class PhysicsInformedPatchTransformer(nn.Module):
         self.diag_encoder = DiagnosticEncoder(in_dim=5, out_dim=32)
         
         # 3. Position Encoding (Learnable)
-        self.pos_embed = nn.Parameter(torch.zeros(1, (MODEL_PARAMS['seq_len'] // patch_len), d_model))
+        self.pos_embed = nn.Parameter(torch.zeros(1, (HPARAMS['seq_len'] // patch_len), d_model))
         
         # 4. Temporal Transformer
         encoder_layer = nn.TransformerEncoderLayer(
@@ -82,14 +82,24 @@ class PhysicsInformedPatchTransformer(nn.Module):
         
 
     def _load_topo_bias(self, n_stations):
-        """Loads or pre-calculates topographic bias matrix."""
-        # Load relative to this file for portability (Colab/Kaggle)
+        """Loads topographic bias and converts to log-space for attention logits.
+        
+        Raw bias is in [0, 1] (similarity). Attention logits live in [-5, +5].
+        Log-transform maps [0,1] -> [-inf, 0], giving weak connections a strong
+        negative penalty. Normalize to unit variance for stable attention temperature.
+        """
         curr_dir = os.path.dirname(os.path.abspath(__file__))
         bias_path = os.path.join(curr_dir, 'topographic_bias.pt')
         
         if os.path.exists(bias_path):
-            print(f"[MODEL] Loading static topographic prior from {bias_path}")
-            return torch.load(bias_path, weights_only=True)
+            raw = torch.load(bias_path, weights_only=True)
+            # Log-transform: similarity -> log-space penalty
+            log_bias = torch.log(raw + 1e-6)
+            # Normalize to zero-mean, unit-variance for stable injection
+            log_bias = (log_bias - log_bias.mean()) / (log_bias.std() + 1e-8)
+            print(f"[MODEL] Loaded log-transformed topographic prior from {bias_path}")
+            print(f"  Log-bias range: [{log_bias.min():.2f}, {log_bias.max():.2f}]")
+            return log_bias
             
         print("[MODEL] WARNING: Topographic bias not found. Using zero initialization.")
         return torch.zeros(n_stations, n_stations)

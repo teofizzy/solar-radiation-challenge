@@ -9,7 +9,7 @@ import pandas as pd
 import torch
 from torch.utils.data import DataLoader
 
-from src.config import HPARAMS, PATHS, MODEL_PARAMS, ensure_dirs, get_n_stations
+from src.config import HPARAMS, PATHS, ensure_dirs, get_n_stations
 from src.model_patch import PhysicsInformedPatchTransformer
 from src.utils import get_device, clean_memory
 
@@ -60,8 +60,8 @@ def predict(dataset, models=None, model_paths: list = None,
                 d_model=HPARAMS['hidden_dim'],
                 nhead=HPARAMS.get('transformer_heads', 8),
                 num_layers=HPARAMS['n_layers'],
-                patch_len=MODEL_PARAMS['patch_len'],
-                stride=MODEL_PARAMS['stride'],
+                patch_len=HPARAMS['patch_len'],
+                stride=HPARAMS['stride'],
                 dropout=HPARAMS['dropout'],
             ).to(device)
             m.load_state_dict(ckpt['model_state_dict'])

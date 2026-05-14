@@ -137,8 +137,8 @@ def train_model(dataset, feature_cols: list, val_months: list = None,
         d_model=HPARAMS['hidden_dim'],
         nhead=HPARAMS.get('transformer_heads', 8),
         num_layers=HPARAMS['n_layers'],
-        patch_len=MODEL_PARAMS['patch_len'],
-        stride=MODEL_PARAMS['stride'],
+        patch_len=HPARAMS['patch_len'],
+        stride=HPARAMS['stride'],
         dropout=HPARAMS['dropout'],
     ).to(device)
     print(f"  Model: PhysicsInformedPatchTransformer (Delta kt)")
@@ -176,26 +176,20 @@ def train_model(dataset, feature_cols: list, val_months: list = None,
         step_scheduler_per_batch = False
         print(f"  Scheduler: CosineAnnealingLR")
 
-    # Loss function (spike-aware, no smoothness penalty)
+    # Loss function (Zindi-aligned multi-task)
     criterion = ZindiSolarLoss(
-        mbe_weight=HPARAMS['mbe_weight'],
-        rmse_weight=HPARAMS['rmse_weight'],
-        night_penalty_weight=HPARAMS['night_penalty_weight'],
-        spike_kt_threshold=HPARAMS.get('spike_kt_threshold', 0.7),
-        spike_weight=HPARAMS.get('spike_weight', 3.0),
+        dkt_weight=HPARAMS.get('dkt_weight', 0.4),
+        zindi_weight=HPARAMS.get('zindi_weight', 0.6),
     )
 
     # Mixed precision scaler
     scaler = torch.amp.GradScaler('cuda', enabled=(device.type == 'cuda'))
 
     # Training history
-    history = {
-        'train_loss': [], 'val_loss': [],
-        'val_mbe': [], 'val_rmse': [], 'val_zindi': [],
-        'lr': [],
-    }
-
+    history = {'train_loss': [], 'val_loss': [], 'val_mbe': [], 'val_rmse': [], 'val_zindi': [], 'val_zindi_ema': [], 'lr': []}
     best_val_score = float('inf')
+    val_zindi_ema = None
+    ema_alpha = 0.3 # Smoothing factor for sweep signal
     patience_counter = 0
 
     print(f"\n[TRAIN] Starting training for {HPARAMS['epochs']} epochs...")
@@ -279,6 +273,12 @@ def train_model(dataset, feature_cols: list, val_months: list = None,
         else:
             val_mbe = val_rmse = val_zindi = float('inf')
 
+        # Compute EMA for stable sweep signal
+        if val_zindi_ema is None:
+            val_zindi_ema = val_zindi
+        else:
+            val_zindi_ema = (1 - ema_alpha) * val_zindi_ema + ema_alpha * val_zindi
+
         # Record history
         current_lr = optimizer.param_groups[0]['lr']
         history['train_loss'].append(avg_train_loss)
@@ -286,6 +286,7 @@ def train_model(dataset, feature_cols: list, val_months: list = None,
         history['val_mbe'].append(val_mbe)
         history['val_rmse'].append(val_rmse)
         history['val_zindi'].append(val_zindi)
+        history['val_zindi_ema'].append(val_zindi_ema)
         history['lr'].append(current_lr)
 
         # Logging
@@ -302,6 +303,7 @@ def train_model(dataset, feature_cols: list, val_months: list = None,
                 'val/mbe': val_mbe,
                 'val/rmse': val_rmse,
                 'val/zindi_score': val_zindi,
+                'val/zindi_score_ema': val_zindi_ema,
                 'lr': current_lr
             })
 
@@ -348,4 +350,4 @@ def train_model(dataset, feature_cols: list, val_months: list = None,
         # Actually it's safer to let the caller handle wandb.finish() if needed.
 
     clean_memory()
-    return model, history
+    return model, history, best_model_path

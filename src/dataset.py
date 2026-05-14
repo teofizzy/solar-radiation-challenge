@@ -15,7 +15,7 @@ import pandas as pd
 import torch
 from torch.utils.data import Dataset
 
-from src.config import MODEL_PARAMS, DTYPE, PATHS, DIAGNOSTIC_FEATURES
+from src.config import HPARAMS, DTYPE, PATHS, DIAGNOSTIC_FEATURES
 
 
 # Feature columns used as model input (ORDER MATTERS -- must be consistent)
@@ -115,8 +115,11 @@ class SolarDataset(Dataset):
     """
 
     def __init__(self, df: pd.DataFrame, feature_cols: list,
-                 is_train: bool = True, scaler_stats: dict = None):
-        self.seq_len = MODEL_PARAMS['seq_len']
+                 is_train: bool = True, scaler_stats: dict = None, hparams: dict = None):
+        
+        # Use provided hparams or fallback to global HPARAMS
+        self.hparams = hparams if hparams is not None else HPARAMS
+        self.seq_len = self.hparams['seq_len']
         self.half_window = self.seq_len // 2
         self.feature_cols = feature_cols
         self.is_train = is_train
@@ -369,7 +372,7 @@ def create_train_val_datasets(df: pd.DataFrame, feature_cols: list,
 
 
 def create_test_dataset(df: pd.DataFrame, feature_cols: list,
-                        scaler_stats: dict):
+                        scaler_stats: dict, hparams: dict = None):
     """
     Create test dataset for inference.
 
@@ -387,4 +390,4 @@ def create_test_dataset(df: pd.DataFrame, feature_cols: list,
     SolarDataset
     """
     return SolarDataset(df, feature_cols, is_train=False,
-                        scaler_stats=scaler_stats)
+                        scaler_stats=scaler_stats, hparams=hparams)

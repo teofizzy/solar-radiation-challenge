@@ -92,53 +92,34 @@ PATHS = {
 # ------------------------------------------------------------------
 HPARAMS = {
     # Sequence / windowing
-    'seq_len': 96,           # 48 past + 48 future = 24hr symmetric window
-    'half_window': 48,       # One side of the symmetric window
-
-    # Transformer-BiLSTM architecture
-    'hidden_dim': 256,       # Scaled up for Transformer/BiLSTM capacity
-    'n_layers': 2,
-    'dropout': 0.15,         # Matched to deeper architecture
-    'embed_dim': 16,         # Station embedding dimension
-
-    # Attention architecture
-    'use_attention': True,   # Use CenterQueryAttention vs center-only
-    'attn_dim': 128,         # Attention projection dimension
-    'attn_dropout': 0.10,    # Attention weight dropout (unanimous consensus)
-    'attn_temperature': 2.0, # Score scaling tau (prevents collapse)
-
+    'seq_len': 192,           # 48 hours @ 15-min
+    'half_window': 96,        # One side of the symmetric window
+    
+    # Patch-Transformer Architecture
+    'hidden_dim': 192,        # Unified d_model (T4 optimized)
+    'n_layers': 4,            # Number of Transformer layers
+    'transformer_heads': 6,   # Must divide hidden_dim
+    'dropout': 0.1,
+    'patch_len': 16,          # 4-hour patches
+    'stride': 8,              # 2-hour sliding stride
+    'station_embed_dim': 32,  # Latent projection of diagnostic features
+    
     # Training
-    'lr': 3e-4,              # Reduced from 1e-3 for OneCycleLR stability
-    'weight_decay': 1e-3,    # Increased from 1e-4 (Gemini recommendation)
-    'batch_size': 256,       # Scaled up for T4 GPU usage
-    'epochs': 120,            # Increased from 50 (longer with lower LR)
-    'patience': 15,          # Increased from 8 (match longer training)
-    'grad_clip': 5.0,        # Relaxed for deep transformer fusion
+    'batch_size': 32,
+    'lr': 1e-4,
+    'weight_decay': 1e-4,
+    'patience': 10,
+    'epochs': 100,
+    'grad_clip': 1.0,
 
-    # LR Scheduler (OneCycleLR)
-    'scheduler': 'onecycle',       # 'onecycle' or 'cosine'
-    'onecycle_pct_start': 0.12,    # Warmup fraction
-    'onecycle_div_factor': 25,     # Initial LR = max_lr / div_factor
-    'onecycle_final_div': 1e4,     # Final LR = max_lr / (div * final_div)
+    # Loss weights (multi-task: auxiliary delta_kt + primary Zindi composite)
+    'dkt_weight': 0.4,
+    'zindi_weight': 0.6,
 
-    # Loss weights
-    'mbe_weight': 0.5,
-    'rmse_weight': 0.5,
-    'night_penalty_weight': 0.01,
-    'spike_kt_threshold': 0.7,     # Upweight errors above this kt
-    'spike_weight': 3.0,           # Weight multiplier for high-kt errors
-
-    # Physics
-    'kt_max': 1.5,           # Max clearness index (cloud edge enhancement)
+    # Physics & Constraints
+    'kt_max': 1.5,
     'night_zenith_threshold': 90.0,
-    'clearsky_min_denom': 1.0,  # Prevent division by zero in kt
-
-    # Post-processing (RTS smoother)
-    'rts_q_kt': 0.0018,     # Process noise for kt state
-    'rts_q_bias': 0.00008,  # Process noise for bias state
-    'rts_r': 0.012,         # Observation noise
-    'savgol_window': 9,     # Savitzky-Golay window (2.25 hours)
-    'savgol_polyorder': 2,  # Savitzky-Golay polynomial order
+    'clearsky_min_denom': 1.0,
 }
 
 # ------------------------------------------------------------------
@@ -162,19 +143,6 @@ FEATURES = {
 }
 
 # ------------------------------------------------------------------
-# 5. MODEL PARAMETERS
-# ------------------------------------------------------------------
-MODEL_PARAMS = {
-    'seq_len': 192,     # 48 hours @ 15-min
-    'patch_len': 16,    # 4-hour patches
-    'stride': 8,        # Overlapping patches
-    'hidden_dim': 128,  # Transformer d_model
-    'num_heads': 8,
-    'num_layers': 3,
-    'dropout': 0.1,
-    'station_embed_dim': 32, # Dim of diagnostic projection
-}
-
 # 15-min intervals: 1h=4, 3h=12, 6h=24, 12h=48
 MULTI_SCALE_LAGS = {
     '1h': 4,
@@ -217,11 +185,11 @@ def get_station_meta():
         if not os.path.exists(meta_path):
             print(f"[CONFIG] station_meta.csv not found at {meta_path}. Generating from Train.csv...")
             train_df = pd.read_csv(PATHS['train'], usecols=['station', 'latitude', 'longitude', 'elevation'])
-            _STATION_META = train_df.drop_duplicates(subset='station').set_index('station')
-            _STATION_META.to_csv(meta_path)
+            _STATION_META = train_df.drop_duplicates(subset='station').reset_index(drop=True)
+            _STATION_META.to_csv(meta_path, index=False)
             print(f"[CONFIG] Generated and saved station_meta.csv to {meta_path}")
         else:
-            _STATION_META = pd.read_csv(meta_path, index_col=0)
+            _STATION_META = pd.read_csv(meta_path)
     return _STATION_META
 
 

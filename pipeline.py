@@ -187,7 +187,7 @@ def run_standard_pipeline():
         print(f"\n--- Training {fold['name'].upper()} ---")
         model_save_dir = os.path.join(PATHS['experiments_dir'], fold['name'])
         
-        model, history = train_model(
+        model, history, _ = train_model(
             dataset=dataset,
             feature_cols=feature_cols,
             val_months=fold['val_months'],
