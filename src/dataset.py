@@ -224,7 +224,10 @@ class SolarDataset(Dataset):
               f"window={self.seq_len}")
 
     def _compute_scaler(self, df: pd.DataFrame, feature_cols: list):
-        """Compute normalization stats from TRAINING data only."""
+        """
+        Compute robust normalization stats (Median/IQR) from TRAINING data only.
+        Weather data is heavy-tailed; mean/std is too sensitive to outliers.
+        """
         if self.is_train:
             # Use only odd months (training months) for scaler
             train_mask = df['month'].isin([1, 3, 5, 7, 9, 11])
@@ -232,26 +235,16 @@ class SolarDataset(Dataset):
         else:
             train_data = df[feature_cols]
 
-        self.mean = train_data.mean().values.astype(np.float32)
-        self.std = train_data.std().values.astype(np.float32)
-        # Prevent division by zero; use 1.0 for near-constant features
-        self.std = np.where(self.std < 1e-6, 1.0, self.std)
-
-        # Robust scaling override for heavy-tailed features.
-        # If any feature's z-range > 15 (indicating extreme outliers),
-        # switch from mean/std to median/IQR for that feature.
+        # Robust Scaling: center on median, scale by IQR
+        self.mean = train_data.median().values.astype(np.float32)
         q25 = train_data.quantile(0.25).values.astype(np.float32)
         q75 = train_data.quantile(0.75).values.astype(np.float32)
-        iqr = q75 - q25
-        median = train_data.median().values.astype(np.float32)
+        self.std = (q75 - q25).values.astype(np.float32)
+        
+        # Prevent division by zero; use 1.0 for constant or binary features
+        self.std = np.where(self.std < 1e-6, 1.0, self.std)
 
-        for i in range(len(feature_cols)):
-            if self.std[i] > 1e-6:
-                z_range = (train_data.iloc[:, i].max() - train_data.iloc[:, i].min()) / self.std[i]
-                if z_range > 15 and iqr[i] > 1e-6:
-                    # Switch to robust: center on median, scale by IQR
-                    self.mean[i] = median[i]
-                    self.std[i] = iqr[i]
+        print(f"  [SCALER] Global Robust Scaling (Median/IQR) active for {len(feature_cols)} features.")
 
     def get_scaler_stats(self) -> dict:
         """Return scaler statistics for reuse in test dataset."""

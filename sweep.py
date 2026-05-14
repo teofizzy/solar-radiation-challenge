@@ -221,7 +221,16 @@ def compute_refined_ranges(project_name: str, entity: str, top_k: int = 10, api_
         return None
     
     # Sort by score (lower is better)
-    valid_runs.sort(key=lambda x: x.summary['val/zindi_score'])
+    # Sort by score (ensure numeric comparison)
+    def get_score(run):
+        try:
+            val = run.summary.get('val/zindi_score')
+            if val is None: return float('inf')
+            return float(val)
+        except (ValueError, TypeError):
+            return float('inf')
+
+    valid_runs.sort(key=get_score)
     top_runs = valid_runs[:top_k]
     
     print(f"[REFINE] Analyzing top {len(top_runs)} runs...")
