@@ -13,7 +13,14 @@ def extract_daily_tropomi(tif_dir: str, prefix: str, meta: pd.DataFrame) -> pd.D
     """
     Extracts daily TROPOMI values using a 3x3 spatial window mean.
     Returns a DataFrame indexed by (date, station) with the feature value.
+    
+    Note: meta must have 'station', 'latitude', 'longitude' columns.
+    The 'station' column is used as the index for spatial lookup.
     """
+    # Ensure station is the index for consistent merge keys
+    if 'station' in meta.columns and meta.index.name != 'station':
+        meta = meta.set_index('station')
+    
     files = glob.glob(os.path.join(tif_dir, f"*{prefix}*.tif"))
     print(f"    Found {len(files)} {prefix} files.")
     
@@ -120,6 +127,10 @@ def compute_tropomi_features(df: pd.DataFrame, force_recompute: bool = False) ->
         temp_df = df_tropo.reset_index()
 
         if len(df_cloud) > 0 and isinstance(df_cloud.index, pd.MultiIndex):
+            # Defensive: align station dtype before merge
+            idx_station_dtype = df_cloud.index.get_level_values('station').dtype
+            if temp_df['station'].dtype != idx_station_dtype:
+                temp_df['station'] = temp_df['station'].astype(idx_station_dtype)
             temp_df = temp_df.merge(
                 df_cloud, left_on=['date', 'station'], right_index=True, how='left'
             )
@@ -129,6 +140,10 @@ def compute_tropomi_features(df: pd.DataFrame, force_recompute: bool = False) ->
                 temp_df[col] = np.nan
 
         if len(df_aero) > 0 and isinstance(df_aero.index, pd.MultiIndex):
+            # Defensive: align station dtype before merge
+            idx_station_dtype = df_aero.index.get_level_values('station').dtype
+            if temp_df['station'].dtype != idx_station_dtype:
+                temp_df['station'] = temp_df['station'].astype(idx_station_dtype)
             temp_df = temp_df.merge(
                 df_aero, left_on=['date', 'station'], right_index=True, how='left'
             )
