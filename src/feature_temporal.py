@@ -312,10 +312,9 @@ def compute_temporal_features(df: pd.DataFrame,
             grad_x_df = pd.DataFrame(grad_x, index=kt_pivot.index, columns=station_names)
             grad_y_df = pd.DataFrame(grad_y, index=kt_pivot.index, columns=station_names)
             
-            # Use stack() to align with MultiIndex (timestamp, station)
-            # This is much faster and more memory-efficient than a full merge
-            grad_x_series = grad_x_df.stack().reorder_levels(['station', 'timestamp']).sort_index()
-            grad_y_series = grad_y_df.stack().reorder_levels(['station', 'timestamp']).sort_index()
+            # Use rename_axis to ensure levels are named correctly for reordering
+            grad_x_series = grad_x_df.rename_axis(index='timestamp', columns='station').stack().swaplevel().sort_index()
+            grad_y_series = grad_y_df.rename_axis(index='timestamp', columns='station').stack().swaplevel().sort_index()
             
             # Ensure df is indexed correctly for assignment
             df_idx = df.set_index(['station', 'timestamp']).index

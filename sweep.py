@@ -128,10 +128,12 @@ def run_sweep_agent(config=None):
         
         print(f"\n[SWEEP] Starting trial with config: {config}")
         
-        # Safety Check: hidden_dim must be divisible by transformer_heads
-        if HPARAMS['hidden_dim'] % HPARAMS.get('transformer_heads', 8) != 0:
-            print(f"[SWEEP] Skipping incompatible config: {config_dict}")
-            return
+        # Compatibility Correction: hidden_dim must be divisible by transformer_heads
+        heads = HPARAMS.get('transformer_heads', 6)
+        if HPARAMS['hidden_dim'] % heads != 0:
+            old_dim = HPARAMS['hidden_dim']
+            HPARAMS['hidden_dim'] = ((old_dim // heads) + 1) * heads
+            print(f"[SWEEP] Adjusted hidden_dim for compatibility: {old_dim} -> {HPARAMS['hidden_dim']} (divisible by {heads} heads)")
             
         # Load Data AFTER HPARAMS update to ensure correct seq_len
         df, feature_cols = build_pipeline_data()
