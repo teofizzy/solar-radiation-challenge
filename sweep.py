@@ -153,18 +153,20 @@ def run_sweep_agent(config=None):
                 use_wandb=True
             )
             
-            best_zindi = min(history['val_zindi'])
+            best_zindi = min(history['val_zindi_score']) if 'val_zindi_score' in history else min(history['val_zindi'])
             print(f"[SWEEP] Trial finished. Best Zindi Score: {best_zindi:.4f}")
 
             # ---- Global Best Model Update ----
+            best_idx = np.argmin(history['val_zindi_score']) if 'val_zindi_score' in history else np.argmin(history['val_zindi'])
             provenance = {
                 'sweep_id': getattr(wandb.run, 'sweep_id', None),
                 'run_id': wandb.run.id,
                 'run_name': run_name,
                 'hparams': {k: v for k, v in config_dict.items()},
-                'best_epoch': int(np.argmin(history['val_zindi'])),
-                'val_mbe': float(history['val_mbe'][np.argmin(history['val_zindi'])]),
-                'val_rmse': float(history['val_rmse'][np.argmin(history['val_zindi'])]),
+                'best_epoch': int(best_idx),
+                'val_mbe': float(history['val_mbe'][best_idx]),
+                'val_rmse': float(history['val_rmse'][best_idx]),
+                'val_zindi': float(best_zindi),
             }
             try_update_global_best(best_model_path, best_zindi, provenance)
 
@@ -269,6 +271,28 @@ def compute_refined_ranges(project_name: str, entity: str, top_k: int = 10, api_
     return refined
 
 
+def normalize_sweep_id(sweep_id: str):
+    """
+    Ensure sweep_id is fully qualified (entity/project/id).
+    W&B agents on remote clusters often fail to resolve short IDs.
+    """
+    if "/" in sweep_id:
+        # Already qualified (or at least partially)
+        parts = sweep_id.split("/")
+        if len(parts) == 3:
+            return sweep_id
+        if len(parts) == 1:
+            pass # fall through
+            
+    entity = WANDB_CONFIG['entity']
+    project = WANDB_CONFIG['project']
+    
+    if not entity or not project:
+        return sweep_id # Cannot normalize
+        
+    return f"{entity}/{project}/{sweep_id}"
+
+
 # ------------------------------------------------------------------
 # Sweep Launcher
 # ------------------------------------------------------------------
@@ -277,7 +301,7 @@ def get_default_sweep_config():
     return {
         'method': 'bayes',
         'metric': {
-            'name': 'val/zindi_score_ema',
+            'name': 'val/zindi_score',
             'goal': 'minimize'
         },
         'early_terminate': {
@@ -371,8 +395,11 @@ def start_sweep(resume_id: str = None, refine: bool = False, count: int = 40, ap
     else:
         print(f"[SWEEP] Joining EXISTING sweep ID: {final_sweep_id}")
 
-    # Start the agent
-    wandb.agent(final_sweep_id, function=run_sweep_agent, count=args.count)
+    # Start the agent with fully qualified sweep ID to avoid 404 on CSCS
+    full_sweep_id = normalize_sweep_id(final_sweep_id)
+    print(f"[SWEEP] Agent joining: {full_sweep_id}")
+    
+    wandb.agent(full_sweep_id, function=run_sweep_agent, count=args.count)
     print("[SWEEP] Sweep completed.")
     
     # Print final global best

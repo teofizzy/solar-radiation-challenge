@@ -127,7 +127,7 @@ HPARAMS = {
 # ------------------------------------------------------------------
 WANDB_CONFIG = {
     'project': 'tahmo-solar-radiation',
-    'entity': None,          # Use default entity
+    'entity': 'teofilo48ligawa-dsail', # Explicit team entity for CSCS
 }
 
 # ------------------------------------------------------------------
