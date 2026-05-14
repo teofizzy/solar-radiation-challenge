@@ -16,20 +16,33 @@ from src.config import PATHS, ERA5_VARS, DTYPE, ensure_dirs
 from src.utils import timer, reduce_mem_usage, validate_no_nan, clean_memory
 
 
-def fix_coords(ds: xr.Dataset) -> xr.Dataset:
+def normalize_era5_coords(ds: xr.Dataset) -> xr.Dataset:
     """
-    Standardize coordinate names to 'latitude' and 'longitude'.
-    Some ERA5 datasets use 'lat'/'lon'.
+    Standardize coordinate names for spatial (lat/lon) and temporal (time) axes.
+    Ensures 'latitude', 'longitude', and 'time' are present if available.
     """
     rename_map = {}
+    
+    # Spatial coordinates
     if 'lat' in ds.coords and 'latitude' not in ds.coords:
         rename_map['lat'] = 'latitude'
     if 'lon' in ds.coords and 'longitude' not in ds.coords:
         rename_map['lon'] = 'longitude'
+        
+    # Temporal coordinates
+    if 'valid_time' in ds.coords and 'time' not in ds.coords:
+        rename_map['valid_time'] = 'time'
+    elif 'forecast_time' in ds.coords and 'time' not in ds.coords:
+        rename_map['forecast_time'] = 'time'
     
     if rename_map:
-        print(f"  [FEATURE_ERA5] Renaming coordinates: {rename_map}")
-        return ds.rename(rename_map)
+        print(f"  [FEATURE_ERA5] Normalizing coordinates: {rename_map}")
+        ds = ds.rename(rename_map)
+        
+    # Ensure time is 1D if it was expanded
+    if 'time' in ds.coords and ds['time'].ndim > 1:
+        ds = ds.isel(step=0, drop=True) if 'step' in ds.dims else ds
+        
     return ds
 
 
@@ -48,7 +61,7 @@ def extract_era5_for_station(ds: xr.Dataset, station_id: str, lat: float, lon: f
         lon = (lon + 180) % 360 - 180
 
     # 2. Standardize naming and FORCE SORTING
-    ds = fix_coords(ds)
+    ds = normalize_era5_coords(ds)
     ds = ds.sortby(['latitude', 'longitude'])
     
     # 3. Robust Temporal Alignment
@@ -173,14 +186,20 @@ def compute_era5_features(df: pd.DataFrame,
                 print(f"  WARNING: No .nc files in {year_dir}")
                 continue
 
-            ds = xr.open_mfdataset(nc_files, combine='by_coords',
-                                   chunks={'time': 100})
+            # Open without specific chunks first to avoid error if 'time' is missing
+            ds = xr.open_mfdataset(nc_files, combine='by_coords')
+            
+            # Normalize coordinates globally
+            ds = normalize_era5_coords(ds)
+            
+            # Now safe to chunk
+            if 'time' in ds.dims:
+                ds = ds.chunk({'time': 100})
             
             # Diagnostic for coordinate and time ranges
-            if 'latitude' in ds.coords or 'lat' in ds.coords:
-                temp_ds = fix_coords(ds)
-                lat_min, lat_max = float(temp_ds.latitude.min()), float(temp_ds.latitude.max())
-                lon_min, lon_max = float(temp_ds.longitude.min()), float(temp_ds.longitude.max())
+            if 'latitude' in ds.coords and 'time' in ds.coords:
+                lat_min, lat_max = float(ds.latitude.min()), float(ds.latitude.max())
+                lon_min, lon_max = float(ds.longitude.min()), float(ds.longitude.max())
                 t_min, t_max = pd.to_datetime(ds.time.min().values), pd.to_datetime(ds.time.max().values)
                 print(f"  [FEATURE_ERA5] Bounds: Lat=[{lat_min:.2f}, {lat_max:.2f}], "
                       f"Lon=[{lon_min:.2f}, {lon_max:.2f}]")
