@@ -399,13 +399,17 @@ if __name__ == '__main__':
     
     # Handle Login
     api_key = args.api_key or os.environ.get('WANDB_API_KEY')
-    if api_key:
-        try:
+    try:
+        if api_key:
             wandb.login(key=api_key)
-            print("[SWEEP] Successfully logged into W&B.")
-        except Exception as e:
-            print(f"[SWEEP] W&B Login failed: {e}")
-    elif os.environ.get('WANDB_MODE') != 'disabled':
-         print("[SWEEP] WARNING: No API Key provided via --api_key or environment variable.")
+            print("[SWEEP] Successfully logged into W&B via provided key.")
+        else:
+            # Native discovery: checks ~/.netrc, then ~/.config/wandb/
+            wandb.login()
+            print("[SWEEP] Successfully logged into W&B via native credentials (.netrc).")
+    except Exception as e:
+        print(f"[SWEEP] W&B Login failed: {e}")
+        if os.environ.get('WANDB_MODE') != 'disabled':
+            print("[SWEEP] Check your ~/.netrc or WANDB_API_KEY environment variable.")
     
     start_sweep(resume_id=args.resume, refine=args.refine, count=args.count)
