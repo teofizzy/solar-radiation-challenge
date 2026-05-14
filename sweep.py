@@ -21,17 +21,7 @@ import wandb
 import gc
 import numpy as np
 
-# Attempt Colab authentication early
-try:
-    from google.colab import userdata
-    wandb_api_key = userdata.get('WANDB_API_KEY')
-    if wandb_api_key:
-        wandb.login(key=wandb_api_key)
-        print("[SWEEP] Successfully logged into W&B via Colab Secrets.")
-except ImportError:
-    pass
-except Exception as e:
-    print(f"[SWEEP] Colab secrets not available: {e}")
+# W&B Login will be handled in the __main__ block via --api_key or environment variables.
 
 from src.config import WANDB_CONFIG, HPARAMS, PATHS
 from src.dataset import SolarDataset
@@ -401,6 +391,21 @@ if __name__ == '__main__':
         '--count', type=int, default=40,
         help='Number of trials to run (default: 40).'
     )
+    parser.add_argument(
+        '--api_key', type=str, default=None,
+        help='W&B API Key for authentication (useful for Colab).'
+    )
     args = parser.parse_args()
+    
+    # Handle Login
+    api_key = args.api_key or os.environ.get('WANDB_API_KEY')
+    if api_key:
+        try:
+            wandb.login(key=api_key)
+            print("[SWEEP] Successfully logged into W&B.")
+        except Exception as e:
+            print(f"[SWEEP] W&B Login failed: {e}")
+    elif os.environ.get('WANDB_MODE') != 'disabled':
+         print("[SWEEP] WARNING: No API Key provided via --api_key or environment variable.")
     
     start_sweep(resume_id=args.resume, refine=args.refine, count=args.count)
