@@ -198,18 +198,7 @@ def compute_physics_features(df: pd.DataFrame,
         df['hour_sin'] = np.sin(2 * np.pi * hour_frac / 24.0).astype(DTYPE)
         df['hour_cos'] = np.cos(2 * np.pi * hour_frac / 24.0).astype(DTYPE)
         
-        df['hour_12_sin'] = np.sin(2 * np.pi * hour_frac / 12.0).astype(DTYPE)
-        df['hour_12_cos'] = np.cos(2 * np.pi * hour_frac / 12.0).astype(DTYPE)
-        
-        df['hour_6_sin'] = np.sin(2 * np.pi * hour_frac / 6.0).astype(DTYPE)
-        df['hour_6_cos'] = np.cos(2 * np.pi * hour_frac / 6.0).astype(DTYPE)
-        
-        df['hour_3_sin'] = np.sin(2 * np.pi * hour_frac / 3.0).astype(DTYPE)
-        df['hour_3_cos'] = np.cos(2 * np.pi * hour_frac / 3.0).astype(DTYPE)
-
-        month = df['month'].values.astype(np.float32)
-        df['month_sin'] = np.sin(2 * np.pi * month / 12.0).astype(DTYPE)
-        df['month_cos'] = np.cos(2 * np.pi * month / 12.0).astype(DTYPE)
+        # Monthly encoding pruned as DOY is more continuous
 
         doy = df['dayofyear'].values.astype(np.float32)
         df['doy_sin'] = np.sin(2 * np.pi * doy / 365.25).astype(DTYPE)

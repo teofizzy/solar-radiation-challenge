@@ -335,36 +335,33 @@ def start_sweep(resume_id: str = None, refine: bool = False, count: int = 40):
             sweep_config = get_default_sweep_config()
             sweep_config['parameters'].update(refined)
             print("[SWEEP] Refined sweep config applied.")
-        
-        sweep_id = wandb.sweep(
-            sweep_config,
-            project=WANDB_CONFIG['project'],
-            entity=WANDB_CONFIG['entity']
-        )
     else:
         # Mode 1: New exploration sweep
         sweep_config = get_default_sweep_config()
-        
-        print("[SWEEP] Initializing NEW exploration sweep...")
-        sweep_id = wandb.sweep(
+    
+    # 4. START AGENT
+    # ------------------------------------------------------------------
+    # Detect GPU device for logging
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    gpu_id = os.environ.get("CUDA_VISIBLE_DEVICES", "0")
+    print(f"\n[SWEEP] Agent starting on Device: {device}:{gpu_id}")
+
+    # Initialize or join existing sweep
+    # Priority: 1. CLI --resume, 2. Env WANDB_SWEEP_ID, 3. Create New
+    final_sweep_id = args.resume or os.environ.get("WANDB_SWEEP_ID")
+    
+    if not final_sweep_id:
+        print(f"[SWEEP] Creating NEW sweep (Refine={args.refine})...")
+        final_sweep_id = wandb.sweep(
             sweep_config,
             project=WANDB_CONFIG['project'],
             entity=WANDB_CONFIG['entity']
         )
-    
-    print(f"[SWEEP] Sweep ID: {sweep_id}")
-    print(f"[SWEEP] Global best model dir: {GLOBAL_BEST_DIR}")
-    
-    # Check existing global best
-    manifest = _read_global_manifest()
-    if manifest:
-        print(f"[SWEEP] Existing global best: Zindi={manifest['val_zindi']:.4f} "
-              f"(from {manifest['provenance'].get('run_name', 'unknown')})")
     else:
-        print("[SWEEP] No existing global best. First trial will establish baseline.")
-    
-    print(f"[SWEEP] Starting agent ({count} trials)...")
-    wandb.agent(sweep_id, function=run_sweep_agent, count=count)
+        print(f"[SWEEP] Joining EXISTING sweep ID: {final_sweep_id}")
+
+    # Start the agent
+    wandb.agent(final_sweep_id, function=run_sweep, count=args.count)
     print("[SWEEP] Sweep completed.")
     
     # Print final global best

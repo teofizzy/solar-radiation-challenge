@@ -57,9 +57,12 @@ class ZindiSolarLoss(nn.Module):
             return zero, {'loss': 0.0, 'dkt_logcosh': 0.0, 'ghi_rmse': 0.0, 
                          'mbe': 0.0, 'zindi': 0.0}
 
-        # 2. Auxiliary: Delta kt LogCosh (robust to outliers)
+        # 2. Auxiliary: Delta kt LogCosh (numerically stable version)
+        # log(cosh(x)) = |x| + log(1 + exp(-2*|x|)) - log(2)
+        # This prevents INF overflow when dkt_err is large (e.g. > 88 in float32 or > 11 in float16)
         dkt_err = delta_kt_pred[day_mask] - target_delta_kt[day_mask]
-        loss_dkt = torch.mean(torch.log(torch.cosh(dkt_err + 1e-9)))
+        abs_err = torch.abs(dkt_err)
+        loss_dkt = torch.mean(abs_err + torch.nn.functional.softplus(-2.0 * abs_err) - np.log(2.0))
         
         # 3. Primary: Zindi Composite on reconstructed GHI
         ghi_err = ghi_pred[day_mask] - target_ghi[day_mask]

@@ -145,6 +145,16 @@ def build_pipeline_data():
         df = compute_temporal_features(df, force_recompute=False)
         gc.collect()
 
+        # ------------------------------------------------------------------
+        # 5b. Interaction Features (Phase B.4)
+        # ------------------------------------------------------------------
+        from src.feature_interaction import compute_interaction_features
+        print("\n" + "=" * 70)
+        print("PHASE B.4: Multiplicative Physics Interactions")
+        print("=" * 70)
+        df = compute_interaction_features(df)
+        gc.collect()
+
     # ------------------------------------------------------------------
     # 6. Dataset Construction (Phase A.4)
     # ------------------------------------------------------------------

@@ -73,8 +73,12 @@ def get_feature_columns(df: pd.DataFrame) -> list:
 
     # Add EWMA drift features
     ewma_cols = [c for c in df.columns if c.startswith('ewma_kt_') or
-                 c in ('drift_proxy', 'log_cum_exposure')]
+                 c in ('drift_proxy', 'log_cum_exposure', 'clearness_regime_shift')]
     candidates += sorted(ewma_cols)
+
+    # Add Interaction features
+    inter_cols = ['zenith_humidity', 'zenith_cloud', 'airmass_aerosol', 'airmass_water']
+    candidates += [c for c in inter_cols if c in df.columns]
 
     # Filter to only available columns
     available = [c for c in candidates if c in df.columns]

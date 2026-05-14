@@ -35,8 +35,10 @@ class PatchEmbedding(nn.Module):
         P = self.patch_len
         
         # Reshape to patches: (B, T/P, P*F)
-        x = x.unfold(1, P, P) # (B, T/P, F, P)
-        x = x.permute(0, 1, 2, 3).contiguous().view(B, -1, F * P)
+        # Corrected unfold logic: (B, n_patches, F, P) -> (B, n_patches, P, F) -> (B, n_patches, P*F)
+        x = x.unfold(1, P, P) # (B, n_patches, F, P)
+        x = x.transpose(2, 3).contiguous() # (B, n_patches, P, F)
+        x = x.view(B, -1, P * F)
         
         x = self.proj(x)
         return self.norm(x)
@@ -93,8 +95,8 @@ class PhysicsInformedPatchTransformer(nn.Module):
         
         if os.path.exists(bias_path):
             raw = torch.load(bias_path, weights_only=True)
-            # Log-transform: similarity -> log-space penalty
-            log_bias = torch.log(raw + 1e-6)
+            # Log-transform: similarity -> log-space penalty. Clamp to 1e-3 to prevent -inf.
+            log_bias = torch.log(torch.clamp(raw, min=1e-3))
             # Normalize to zero-mean, unit-variance for stable injection
             log_bias = (log_bias - log_bias.mean()) / (log_bias.std() + 1e-8)
             print(f"[MODEL] Loaded log-transformed topographic prior from {bias_path}")
@@ -108,6 +110,10 @@ class PhysicsInformedPatchTransformer(nn.Module):
                 clear_sky_ghi, is_night, center_kt_landsaf):
         
         B = x.shape[0]
+        
+        # 0. Defensive Sanitization (Anti-NaN)
+        x = torch.nan_to_num(x, nan=0.0, posinf=1e3, neginf=-1e3)
+        diag_vector = torch.nan_to_num(diag_vector, nan=0.0)
         
         # 1. Patching & Temporal Transformer
         x = self.patch_embed(x) # (B, n_patches, d_model)
@@ -123,18 +129,21 @@ class PhysicsInformedPatchTransformer(nn.Module):
         # 3. Diagnostic Embedding
         z_diag = self.diag_encoder(diag_vector) # (B, 32)
         
-        # 4. Spatial Attention (Advection Proxy)
+        # Spatial Attention (Cosine Similarity formulation for numerical stability)
         # query: (B, 4, d_model), key/value: (B, 40, d_model)
-        query = z_temp 
-        key = self.station_memory.unsqueeze(0).expand(B, -1, -1) # (B, 40, d_model)
+        # Normalizing query and key converts matmul to cosine similarity, bounding logits.
+        query = F.normalize(z_temp, dim=-1) 
+        key = F.normalize(self.station_memory, dim=-1).unsqueeze(0).expand(B, -1, -1) 
         
         # Topographic Bias: scale is learnable
         bias_mask = (self.topo_bias[station_idx] * self.topo_scale).unsqueeze(1) # (B, 1, 40)
         
-        d_k = self.d_model
         # scores: (B, 4, 40)
-        scores = torch.matmul(query, key.transpose(-2, -1)) / np.sqrt(d_k)
+        scores = torch.matmul(query, key.transpose(-2, -1))
         scores = scores + bias_mask # Add Topographic Bias (broadcasts over 4 tokens)
+        
+        # Logit clamping prevents softmax saturation and INF gradients in AMP
+        scores = torch.clamp(scores, min=-20, max=20)
         
         attn_weights = torch.softmax(scores, dim=-1)
         z_spatial = torch.matmul(attn_weights, key) # (B, 4, d_model)
@@ -151,12 +160,22 @@ class PhysicsInformedPatchTransformer(nn.Module):
         delta_kt_pred = out[:, 0] * 1.2
         raw_corr = out[:, 1] * 20.0 # Small correction in W/m2
         
-        # Physics Reconstruct
-        kt_pred = center_kt_landsaf + delta_kt_pred
-        kt_pred = torch.clamp(kt_pred, 0.0, 1.4) # Relaxed upper bound (cloud enhancement)
-        
-        ghi_physics = kt_pred * clear_sky_ghi
-        ghi_pred = ghi_physics + raw_corr # Final prediction with residual correction
-        ghi_pred = ghi_pred * (1.0 - is_night)
-        
+        # Physics Reconstruction (Force FP32 to prevent overflow in clear-sky multiplication)
+        with torch.amp.autocast('cuda', enabled=False):
+            delta_kt_pred_f32 = delta_kt_pred.float()
+            center_kt_landsaf_f32 = center_kt_landsaf.float()
+            clear_sky_ghi_f32 = clear_sky_ghi.float()
+            raw_corr_f32 = raw_corr.float()
+            is_night_f32 = is_night.float()
+
+            kt_pred = center_kt_landsaf_f32 + delta_kt_pred_f32
+            kt_pred = torch.clamp(kt_pred, 0.0, 1.4)
+            
+            ghi_physics = kt_pred * clear_sky_ghi_f32
+            ghi_pred = ghi_physics + raw_corr_f32
+            ghi_pred = ghi_pred * (1.0 - is_night_f32)
+            
+            # Clamp final GHI to physical range
+            ghi_pred = torch.clamp(ghi_pred, min=0.0)
+            
         return delta_kt_pred, ghi_pred
