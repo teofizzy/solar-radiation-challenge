@@ -11,7 +11,7 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, Subset
 
 from src.config import HPARAMS, PATHS, SEED, WANDB_CONFIG, seed_everything, ensure_dirs, get_n_stations
-from src.model_lstm import PhysicsInformedCNNBiLSTM
+from src.model_patch import PhysicsInformedPatchTransformer
 from src.loss import ZindiSolarLoss, compute_zindi_score
 from src.utils import timer, get_device, clean_memory
 
@@ -131,15 +131,17 @@ def train_model(dataset, feature_cols: list, val_months: list = None,
     n_features = len(feature_cols)
     n_stations = get_n_stations()
 
-    model = PhysicsInformedCNNBiLSTM(
+    model = PhysicsInformedPatchTransformer(
         n_features=n_features,
         n_stations=n_stations,
-        hidden_dim=HPARAMS['hidden_dim'],
-        n_layers=HPARAMS['n_layers'],
-        embed_dim=HPARAMS['embed_dim'],
+        d_model=HPARAMS['hidden_dim'],
+        nhead=HPARAMS.get('transformer_heads', 8),
+        num_layers=HPARAMS['n_layers'],
+        patch_len=MODEL_PARAMS['patch_len'],
+        stride=MODEL_PARAMS['stride'],
         dropout=HPARAMS['dropout'],
     ).to(device)
-    print(f"  Model: PhysicsInformedCNNBiLSTM (Delta kt)")
+    print(f"  Model: PhysicsInformedPatchTransformer (Delta kt)")
 
     print(f"  Model parameters: {sum(p.numel() for p in model.parameters()):,}")
 
@@ -215,11 +217,13 @@ def train_model(dataset, feature_cols: list, val_months: list = None,
             target_delta_kt = batch['target_delta_kt'].to(device)
             center_kt_landsaf = batch['center_kt_landsaf'].to(device)
 
+            diag_vector = batch['diag_vector'].to(device)
+
             optimizer.zero_grad(set_to_none=True)
 
             with torch.amp.autocast('cuda', enabled=(device.type == 'cuda')):
-                delta_kt_pred, ghi_pred, station_bias = model(x, station_idx, clear_sky, is_night, center_kt_landsaf)
-                loss, loss_dict = criterion(ghi_pred, target_ghi, delta_kt_pred, target_delta_kt, is_night, station_bias, center_kt_landsaf)
+                delta_kt_pred, ghi_pred = model(x, station_idx, diag_vector, clear_sky, is_night, center_kt_landsaf)
+                loss, loss_dict = criterion(delta_kt_pred, ghi_pred, target_delta_kt, target_ghi, is_night, clear_sky)
 
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
@@ -233,7 +237,7 @@ def train_model(dataset, feature_cols: list, val_months: list = None,
             if step_scheduler_per_batch:
                 scheduler.step()
 
-            train_losses.append(loss_dict['total'])
+            train_losses.append(loss_dict['loss'])
 
         # CosineAnnealing steps per epoch
         if not step_scheduler_per_batch:
@@ -254,8 +258,10 @@ def train_model(dataset, feature_cols: list, val_months: list = None,
                 target_ghi = batch['target_ghi']
                 center_kt_landsaf = batch['center_kt_landsaf'].to(device)
 
+                diag_vector = batch['diag_vector'].to(device)
+
                 with torch.amp.autocast('cuda', enabled=(device.type == 'cuda')):
-                    delta_kt_pred, ghi_pred, station_bias = model(x, station_idx, clear_sky, is_night, center_kt_landsaf)
+                    delta_kt_pred, ghi_pred = model(x, station_idx, diag_vector, clear_sky, is_night, center_kt_landsaf)
 
                 val_preds.extend(ghi_pred.cpu().numpy())
                 val_targets.extend(target_ghi.numpy())

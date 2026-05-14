@@ -112,6 +112,25 @@ def compute_temporal_features(df: pd.DataFrame,
                     )
                     new_columns[col_median] = roll_median.fillna(0).astype(DTYPE)
 
+                if f'{var}_roll_min_{window_name}' not in df.columns:
+                    roll_min = df.groupby('station')[var].transform(
+                        lambda x: x.rolling(window=window_size, min_periods=1).min()
+                    )
+                    new_columns[f'{var}_roll_min_{window_name}'] = roll_min.fillna(0).astype(DTYPE)
+
+                if f'{var}_roll_max_{window_name}' not in df.columns:
+                    roll_max = df.groupby('station')[var].transform(
+                        lambda x: x.rolling(window=window_size, min_periods=1).max()
+                    )
+                    new_columns[f'{var}_roll_max_{window_name}'] = roll_max.fillna(0).astype(DTYPE)
+
+                # Linear trend proxy: (current - window_start) / window_size
+                col_slope = f'{var}_roll_slope_{window_name}'
+                if col_slope not in df.columns:
+                    shift_val = df.groupby('station')[var].shift(window_size)
+                    slope = (df[var] - shift_val) / window_size
+                    new_columns[col_slope] = slope.fillna(0).astype(DTYPE)
+
         # ----------------------------------------------------------
         # 1.5. Wavelet Proxies (Multi-scale differences)
         # ----------------------------------------------------------

@@ -24,7 +24,9 @@ def compute_physics_features(df: pd.DataFrame,
         dewpoint_depression, pw_attenuation, turbidity_proxy,
         hour_sin, hour_cos, month_sin, month_cos, doy_sin, doy_cos,
         log_clearsky_ghi, log_precipitation, log_wind_speed,
-        t2m_celsius, d2m_celsius
+        log_clearsky_ghi, log_precipitation, log_wind_speed,
+        t2m_celsius, d2m_celsius,
+        t_lapse_corr, p_hyps_corr, csghi_terrain_corr
 
     Parameters
     ----------
@@ -47,7 +49,8 @@ def compute_physics_features(df: pd.DataFrame,
         'hour_6_sin', 'hour_6_cos', 'hour_3_sin', 'hour_3_cos',
         'month_sin', 'month_cos', 'doy_sin', 'doy_cos', 'log_clearsky_ghi',
         'log_precipitation', 'log_wind_speed',
-        't2m_celsius', 'd2m_celsius', 'days_since_start'
+        't2m_celsius', 'd2m_celsius', 'days_since_start',
+        't_lapse_corr', 'p_hyps_corr', 'csghi_terrain_corr'
     ]
 
     recompute = force_recompute
@@ -143,6 +146,26 @@ def compute_physics_features(df: pd.DataFrame,
             df['dewpoint_depression'] = np.float32(0.0)
 
         # ----------------------------------------------------------
+        # 3b. Topographic Corrections (Temperature & Pressure)
+        # ----------------------------------------------------------
+        z_station = df['dem'].values if 'dem' in df.columns else df['elevation'].values
+        # ERA5 elevation = geopotential (z) / g
+        z_era5 = (df['z'].values / 9.80665) if 'z' in df.columns else z_station
+        dz = z_station - z_era5
+
+        # Lapse rate correction (standard 0.0065 K/m)
+        df['t_lapse_corr'] = (df['t2m_celsius'] - 0.0065 * dz).astype(DTYPE)
+
+        # Hypsometric pressure correction
+        if 'sp' in df.columns:
+            # P_station = P_era5 * exp(-g * dz / (R * T_mean))
+            t_mean = (df['t2m'].values + (df['t_lapse_corr'].values + 273.15)) / 2.0
+            p_corr = df['sp'].values * np.exp(-9.80665 * dz / (287.05 * t_mean))
+            df['p_hyps_corr'] = p_corr.astype(DTYPE)
+        else:
+            df['p_hyps_corr'] = np.float32(101325.0)
+
+        # ----------------------------------------------------------
         # 4. Precipitable water attenuation
         # pw_att = exp(-0.1 * AM * tcwv)
         # ----------------------------------------------------------
@@ -193,9 +216,31 @@ def compute_physics_features(df: pd.DataFrame,
         df['doy_cos'] = np.cos(2 * np.pi * doy / 365.25).astype(DTYPE)
 
         # ----------------------------------------------------------
+        # 6b. Terrain-Adjusted Clear Sky GHI
+        # ----------------------------------------------------------
+        if all(c in df.columns for c in ['slope', 'aspect_sin', 'aspect_cos', 'solar_zenith', 'solar_azimuth']):
+            # cos(theta_i) = cos(z)cos(slope) + sin(z)sin(slope)cos(azimuth - aspect)
+            sz = np.radians(df['solar_zenith'].values)
+            slope = np.radians(df['slope'].values)
+            azimuth = np.radians(df['solar_azimuth'].values)
+            aspect = np.arctan2(df['aspect_sin'].values, df['aspect_cos'].values)
+            
+            cos_theta_i = (np.cos(sz) * np.cos(slope) + 
+                           np.sin(sz) * np.sin(slope) * np.cos(azimuth - aspect))
+            
+            # Correction factor: cos(theta_i) / cos(theta_z)
+            # Clip zenith to 85 to avoid division by zero
+            cos_sz_clip = np.cos(np.clip(sz, 0, np.radians(85)))
+            terrain_factor = np.clip(cos_theta_i / cos_sz_clip, 0.5, 2.0)
+            
+            df['csghi_terrain_corr'] = (df['clear_sky_ghi'].values * terrain_factor).astype(DTYPE)
+        else:
+            df['csghi_terrain_corr'] = df['clear_sky_ghi'].values
+
+        # ----------------------------------------------------------
         # 7. Log transforms for skewed variables
         # ----------------------------------------------------------
-        df['log_clearsky_ghi'] = np.log1p(df['clear_sky_ghi'].values).astype(DTYPE)
+        df['log_clearsky_ghi'] = np.log1p(df['csghi_terrain_corr'].values).astype(DTYPE)
 
         # Log-transform precipitation (extreme right-skew, z-range ~62 -> ~5)
         if 'precipitation' in df.columns:

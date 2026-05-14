@@ -9,8 +9,8 @@ import pandas as pd
 import torch
 from torch.utils.data import DataLoader
 
-from src.config import HPARAMS, PATHS, ensure_dirs, get_n_stations
-from src.model_lstm import PhysicsInformedCNNBiLSTM
+from src.config import HPARAMS, PATHS, MODEL_PARAMS, ensure_dirs, get_n_stations
+from src.model_patch import PhysicsInformedPatchTransformer
 from src.utils import get_device, clean_memory
 
 
@@ -54,14 +54,20 @@ def predict(dataset, models=None, model_paths: list = None,
             n_features = len(ckpt.get('feature_cols', feature_cols or []))
             n_stations = get_n_stations()
 
-            m = PhysicsInformedCNNBiLSTM(
+            m = PhysicsInformedPatchTransformer(
                 n_features=n_features,
                 n_stations=n_stations,
+                d_model=HPARAMS['hidden_dim'],
+                nhead=HPARAMS.get('transformer_heads', 8),
+                num_layers=HPARAMS['n_layers'],
+                patch_len=MODEL_PARAMS['patch_len'],
+                stride=MODEL_PARAMS['stride'],
+                dropout=HPARAMS['dropout'],
             ).to(device)
             m.load_state_dict(ckpt['model_state_dict'])
             m.eval()
             models.append(m)
-            print(f"[PREDICT] Loaded model from {path}")
+            print(f"[PREDICT] Loaded Patch-Transformer from {path}")
     else:
         for m in models:
             m.eval()
@@ -80,6 +86,7 @@ def predict(dataset, models=None, model_paths: list = None,
         for batch in loader:
             x = batch['x'].to(device)
             station_idx = batch['station_idx'].to(device)
+            diag_vector = batch['diag_vector'].to(device)
             clear_sky = batch['clear_sky_ghi'].to(device)
             is_night = batch['is_night'].to(device)
             center_kt_landsaf = batch['center_kt_landsaf'].to(device)
@@ -90,7 +97,7 @@ def predict(dataset, models=None, model_paths: list = None,
             
             for m in models:
                 with torch.amp.autocast('cuda', enabled=(device.type == 'cuda')):
-                    _, ghi_pred, _ = m(x, station_idx, clear_sky, is_night, center_kt_landsaf)
+                    _, ghi_pred = m(x, station_idx, diag_vector, clear_sky, is_night, center_kt_landsaf)
                 ensemble_ghi.append(ghi_pred.cpu().numpy())
                 
             # Average across the ensemble

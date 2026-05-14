@@ -80,6 +80,19 @@ def build_pipeline_data():
         gc.collect()
 
     # ------------------------------------------------------------------
+    # 3.5 Static Topographic Features (Phase C)
+    # ------------------------------------------------------------------
+    if FEATURES.get('use_static', False):
+        from src.feature_static import compute_static_features
+
+        print("\n" + "=" * 70)
+        print("PHASE C: Static Topographic Prior Features")
+        print("=" * 70)
+
+        df = compute_static_features(df, force_recompute=False)
+        gc.collect()
+
+    # ------------------------------------------------------------------
     # 4. Physics-Derived Features (Phase B.2)
     # ------------------------------------------------------------------
     if FEATURES['use_physics']:
@@ -117,6 +130,7 @@ def build_pipeline_data():
 
         df = compute_tropomi_features(df, force_recompute=False)
         gc.collect()
+
 
     # ------------------------------------------------------------------
     # 5. Temporal Features (Phase B.3)

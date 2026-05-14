@@ -24,13 +24,15 @@ from src.config import HPARAMS
 class PhysicsInformedCNNBiLSTM(nn.Module):
     def __init__(self, n_features: int, n_stations: int,
                  hidden_dim: int = None, n_layers: int = None,
-                 embed_dim: int = None, dropout: float = None):
+                 embed_dim: int = None, dropout: float = None,
+                 nhead: int = None):
         super().__init__()
 
         hidden_dim = hidden_dim or HPARAMS.get('hidden_dim', 128)
         n_layers = n_layers or HPARAMS.get('n_layers', 2)
         embed_dim = embed_dim or HPARAMS.get('embed_dim', 32)
         dropout = dropout or HPARAMS.get('dropout', 0.2)
+        nhead = nhead or HPARAMS.get('transformer_heads', 8)
 
         self.hidden_dim = hidden_dim
         self.n_layers = n_layers
@@ -57,8 +59,9 @@ class PhysicsInformedCNNBiLSTM(nn.Module):
         )
 
         # Transformer Sequence Fusion
+        nhead = nhead or HPARAMS.get('transformer_heads', 8)
         encoder_layer = nn.TransformerEncoderLayer(
-            d_model=hidden_dim, nhead=8, dim_feedforward=hidden_dim * 4, 
+            d_model=hidden_dim, nhead=nhead, dim_feedforward=hidden_dim * 4, 
             dropout=dropout, batch_first=True
         )
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)

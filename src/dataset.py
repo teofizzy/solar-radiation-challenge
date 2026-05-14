@@ -15,15 +15,14 @@ import pandas as pd
 import torch
 from torch.utils.data import Dataset
 
-from src.config import HPARAMS, DTYPE, PATHS
+from src.config import MODEL_PARAMS, DTYPE, PATHS, DIAGNOSTIC_FEATURES
 
 
 # Feature columns used as model input (ORDER MATTERS -- must be consistent)
-ASTRO_FEATURES = ['cos_zenith', 'solar_zenith', 'clear_sky_ghi', 'log_clearsky_ghi']
+ASTRO_FEATURES = ['cos_zenith', 'solar_zenith', 'csghi_terrain_corr', 'log_clearsky_ghi']
 
-# ERA5: Use Celsius conversions instead of raw Kelvin t2m/d2m.
-# Raw sp stays (z-range ~4.7, well-behaved). Raw tco3/tcwv stay.
-ERA5_FEATURES = ['u10', 'v10', 'd2m_celsius', 't2m_celsius', 'sp', 'tco3', 'tcwv']
+# ERA5: Use terrain-corrected versions (lapse rate, hypsometry)
+ERA5_FEATURES = ['u10', 'v10', 't_lapse_corr', 'p_hyps_corr', 'tco3', 'tcwv']
 
 PHYSICS_FEATURES = [
     'air_mass', 'wind_speed', 'log_wind_speed',
@@ -31,7 +30,8 @@ PHYSICS_FEATURES = [
     'dewpoint_depression', 'pw_attenuation', 'turbidity_proxy',
     'hour_sin', 'hour_cos', 'hour_12_sin', 'hour_12_cos', 
     'hour_6_sin', 'hour_6_cos', 'hour_3_sin', 'hour_3_cos',
-    'month_sin', 'month_cos', 'doy_sin', 'doy_cos', 'days_since_start'
+    'month_sin', 'month_cos', 'doy_sin', 'doy_cos', 'days_since_start',
+    'csghi_terrain_corr'
 ]
 
 # Use log_precipitation instead of raw precipitation (z-range 62 -> ~5)
@@ -44,12 +44,22 @@ LANDSAF_FEATURES = ['mdssf', 'mlst', 'kt_landsaf']
 TROPOMI_FEATURES = ['tropomi_cloud', 'tropomi_cloud_missing', 'tropomi_cloud_age_hours', 
                     'tropomi_aerosol', 'tropomi_aerosol_missing', 'tropomi_aerosol_age_hours']
 
+# Static: Keep only 'dist_water' (lake/sea breeze) as raw feature.
+# Others (dem, slope, aspect) are now baked into physics features.
+STATIC_FEATURES = ['dist_water']
+# Land use OHE columns will be added dynamically by the 'lu_' prefix check
+
 def get_feature_columns(df: pd.DataFrame) -> list:
     """
     Determine which feature columns are available in the DataFrame.
     Returns the ordered list of feature column names for model input.
     """
-    candidates = ASTRO_FEATURES + ERA5_FEATURES + PHYSICS_FEATURES + LOCAL_FEATURES + LANDSAF_FEATURES + TROPOMI_FEATURES
+    candidates = (ASTRO_FEATURES + ERA5_FEATURES + PHYSICS_FEATURES + 
+                  LOCAL_FEATURES + LANDSAF_FEATURES + TROPOMI_FEATURES + STATIC_FEATURES)
+
+    # Add Land Use OHE (e.g. lu_12)
+    lu_cols = [c for c in df.columns if c.startswith('lu_')]
+    candidates += sorted(lu_cols)
 
     # Add any temporal rolling columns
     rolling_cols = [c for c in df.columns if '_roll_' in c or '_diff_' in c or
@@ -106,10 +116,24 @@ class SolarDataset(Dataset):
 
     def __init__(self, df: pd.DataFrame, feature_cols: list,
                  is_train: bool = True, scaler_stats: dict = None):
-        self.half_window = HPARAMS['half_window']
-        self.seq_len = HPARAMS['seq_len']
+        self.seq_len = MODEL_PARAMS['seq_len']
+        self.half_window = self.seq_len // 2
         self.feature_cols = feature_cols
         self.is_train = is_train
+
+        # Load Diagnostic Descriptors
+        diag_path = os.path.join(PATHS['cache_raw'], 'station_diagnostic_summary.csv')
+        if os.path.exists(diag_path):
+            diag_df = pd.read_csv(diag_path)
+            # Normalize diagnostic features internally (Min-Max)
+            for col in DIAGNOSTIC_FEATURES:
+                if col in diag_df.columns:
+                    c_min, c_max = diag_df[col].min(), diag_df[col].max()
+                    diag_df[col] = (diag_df[col] - c_min) / (c_max - c_min + 1e-9)
+            self.diag_map = diag_df.set_index('station')[DIAGNOSTIC_FEATURES].to_dict('index')
+        else:
+            print(f"WARNING: {diag_path} not found. Using zero diagnostic vectors.")
+            self.diag_map = {}
 
         # Sort by station and timestamp to ensure temporal ordering
         df = df.sort_values(['station', 'timestamp']).reset_index(drop=True)
@@ -160,10 +184,16 @@ class SolarDataset(Dataset):
 
             # Generate valid window centers
             for center in range(self.half_window, n_rows - self.half_window):
+                # Get diagnostic vector
+                diag_vec = self.diag_map.get(station_id, {c: 0.0 for c in DIAGNOSTIC_FEATURES})
+                diag_tensor = np.array([diag_vec[c] for c in DIAGNOSTIC_FEATURES], dtype=np.float32)
+
                 self.samples.append({
                     'feat_matrix': feat_matrix,
+                    'is_night_full': is_night,
                     'center': center,
                     'station_idx': station_idx,
+                    'diag_vector': diag_tensor,
                     'clear_sky_ghi': clear_sky[center],
                     'is_night': is_night[center],
                     'target_delta_kt': target_delta_kt[center],
@@ -237,9 +267,20 @@ class SolarDataset(Dataset):
         # Handle any NaN in features (replace with 0 after normalization)
         window = np.nan_to_num(window, nan=0.0)
 
+        x_tensor = torch.from_numpy(window)
+        is_night_seq = sample['is_night_full'][center - hw:center + hw] # (seq_len,)
+        is_night_tensor = torch.from_numpy(is_night_seq).float()
+        
+        # 8. Augmentations (Training Only)
+        if self.is_train:
+            from src.augment import apply_intensity_jitter, apply_temporal_mask
+            x_tensor = apply_intensity_jitter(x_tensor, is_night_tensor, p=0.4)
+            x_tensor = apply_temporal_mask(x_tensor, p=0.2)
+
         return {
-            'x': torch.from_numpy(window),                              # (seq_len, n_features)
+            'x': x_tensor,                              # (seq_len, n_features)
             'station_idx': torch.tensor(sample['station_idx'], dtype=torch.long),
+            'diag_vector': torch.from_numpy(sample['diag_vector']),     # (5,)
             'clear_sky_ghi': torch.tensor(sample['clear_sky_ghi'], dtype=torch.float32),
             'is_night': torch.tensor(sample['is_night'], dtype=torch.float32),
             'target_delta_kt': torch.tensor(sample['target_delta_kt'], dtype=torch.float32),

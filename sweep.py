@@ -19,6 +19,8 @@ from src.config import WANDB_CONFIG, HPARAMS, PATHS
 from src.dataset import SolarDataset
 from pipeline import build_pipeline_data
 from src.train import train_model
+from src.predict import predict, generate_submission
+from src.dataset import create_test_dataset
 
 def run_sweep_agent():
     """
@@ -52,6 +54,27 @@ def run_sweep_agent():
                 use_wandb=True
             )
             print(f"[SWEEP] Trial finished. Best Zindi Score: {min(history['val_zindi']):.4f}")
+
+            # ---- Inference & Submission Logging ----
+            print(f"[SWEEP] Generating submission for run {run_name}...")
+            # We need the scaler stats from the train dataset
+            scaler_stats = dataset.get_scaler_stats()
+            test_dataset = create_test_dataset(df, feature_cols, scaler_stats)
+            
+            # Predict
+            predictions = predict(test_dataset, models=[model], feature_cols=feature_cols)
+            
+            # Save submission with run name
+            sub_filename = f"submission_{run_name}.csv"
+            sub_path = os.path.join(PATHS['submissions_dir'], sub_filename)
+            submission_df = generate_submission(predictions, output_path=sub_path)
+            
+            # Log submission to W&B as an artifact
+            artifact = wandb.Artifact(name=f"submission_{run_name}", type="submission")
+            artifact.add_file(sub_path)
+            wandb.log_artifact(artifact)
+            print(f"[SWEEP] Submission logged to W&B: {sub_filename}")
+
         except Exception as e:
             print(f"[SWEEP] Trial failed with error: {e}")
             import traceback
@@ -81,12 +104,18 @@ def start_sweep():
                 'max': 5e-3
             },
             'hidden_dim': {
-                'values': [32, 64, 128]
+                'values': [128, 256, 512]
+            },
+            'num_layers': {
+                'values': [2, 3, 4]
+            },
+            'transformer_heads': {
+                'values': [4, 8]
             },
             'dropout': {
                 'distribution': 'uniform',
                 'min': 0.1,
-                'max': 0.4
+                'max': 0.3
             },
             'weight_decay': {
                 'distribution': 'log_uniform_values',

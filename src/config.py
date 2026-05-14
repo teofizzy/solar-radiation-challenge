@@ -33,12 +33,24 @@ def seed_everything(seed: int = SEED):
 # ------------------------------------------------------------------
 # Detect environment: Colab vs local
 IS_COLAB = os.path.exists('/content')
+IS_KAGGLE = os.path.exists('/kaggle')
 
 # Base project directory
 if IS_COLAB:
     PROJECT_DIR = '/content/drive/MyDrive/TAHMO_Challenge'
-    # Use the same directory for data as they are all in the root folder
     LOCAL_DATA_DIR = PROJECT_DIR 
+elif IS_KAGGLE:
+    # On Kaggle, priority: 1. Working dir (Drive cache), 2. Input dataset
+    PROJECT_DIR = '/kaggle/working/TAHMO_Challenge'
+    input_dataset_path = '/kaggle/input/tahmo-solar-radiation-data'
+    
+    if os.path.exists(os.path.join(PROJECT_DIR, 'Train.csv')):
+        LOCAL_DATA_DIR = PROJECT_DIR
+    elif os.path.exists(input_dataset_path):
+        LOCAL_DATA_DIR = input_dataset_path
+    else:
+        # Fallback to current working directory
+        LOCAL_DATA_DIR = os.getcwd()
 else:
     PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     LOCAL_DATA_DIR = os.path.join(PROJECT_DIR, 'data')
@@ -149,18 +161,40 @@ FEATURES = {
     'use_tropomi': True,       # Phase D (optional)
 }
 
+# ------------------------------------------------------------------
+# 5. MODEL PARAMETERS
+# ------------------------------------------------------------------
+MODEL_PARAMS = {
+    'seq_len': 192,     # 48 hours @ 15-min
+    'patch_len': 16,    # 4-hour patches
+    'stride': 8,        # Overlapping patches
+    'hidden_dim': 128,  # Transformer d_model
+    'num_heads': 8,
+    'num_layers': 3,
+    'dropout': 0.1,
+    'station_embed_dim': 32, # Dim of diagnostic projection
+}
+
 # 15-min intervals: 1h=4, 3h=12, 6h=24, 12h=48
 MULTI_SCALE_LAGS = {
     '1h': 4,
     '3h': 12,
     '6h': 24,
-    '12h': 48
+    '12h': 48,
+    '24h': 96,
+    '72h': 288
 }
 
+# Static Diagnostic Descriptors (from full_diagnostic.py)
+DIAGNOSTIC_FEATURES = [
+    'night_offset', 'drift_slope', 'avg_residual_bias', 
+    'train_null_pct', 'max_rad'
+]
+
 # ------------------------------------------------------------------
-# 4. ERA5 VARIABLES
+# 6. ERA5 VARIABLES
 # ------------------------------------------------------------------
-ERA5_VARS = ['u10', 'v10', 'd2m', 't2m', 'sp', 'tco3', 'tcwv']
+ERA5_VARS = ['u10', 'v10', 'd2m', 't2m', 'sp', 'tco3', 'tcwv', 'z']
 
 # ------------------------------------------------------------------
 # 5. DTYPE POLICY
