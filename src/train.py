@@ -114,7 +114,7 @@ def train_model(dataset, feature_cols: list, val_months: list = None,
         train_subset,
         batch_size=HPARAMS['batch_size'],
         shuffle=True,
-        num_workers=4,     # Accelerated
+        num_workers=2,     # Optimized for Colab stability
         pin_memory=True,   # Accelerated
         drop_last=True,
     )
@@ -123,7 +123,7 @@ def train_model(dataset, feature_cols: list, val_months: list = None,
         val_subset,
         batch_size=HPARAMS['batch_size'] * 2,
         shuffle=False,
-        num_workers=4,
+        num_workers=2,     # Optimized for Colab stability
         pin_memory=True,
     )
 

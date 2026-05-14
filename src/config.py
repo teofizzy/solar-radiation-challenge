@@ -143,12 +143,9 @@ FEATURES = {
 }
 
 # ------------------------------------------------------------------
-# 15-min intervals: 1h=4, 3h=12, 6h=24, 12h=48
+# Pruned for memory: 1h (cloud transients), 24h (diurnal), 72h (synoptic)
 MULTI_SCALE_LAGS = {
     '1h': 4,
-    '3h': 12,
-    '6h': 24,
-    '12h': 48,
     '24h': 96,
     '72h': 288
 }

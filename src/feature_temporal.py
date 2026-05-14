@@ -79,69 +79,37 @@ def compute_temporal_features(df: pd.DataFrame,
         print(f"  Rolling variables: {available_rolling}")
 
         # ----------------------------------------------------------
-        # 1. Rolling mean/std per station (covariates only)
+        # 1. Optimized Rolling Stats (Mean, Std, Slope)
         # ----------------------------------------------------------
+        # We prune stats to the most physically relevant ones for a Transformer
         for var in available_rolling:
+            # Pre-sort by station and timestamp for vectorized rolling
+            group_obj = df.groupby('station')[var]
+            
             for window_name, window_size in MULTI_SCALE_LAGS.items():
+                # MEAN: Primary baseline signal
                 col_mean = f'{var}_roll_mean_{window_name}'
-                col_std = f'{var}_roll_std_{window_name}'
-                col_median = f'{var}_roll_median_{window_name}'
-
                 if col_mean not in df.columns:
-                    # CLOSED='RIGHT' AND CENTER=FALSE ENSURES STRICT CAUSALITY
-                    roll = df.groupby('station')[var].transform(
-                        lambda x: x.rolling(
-                            window=window_size, min_periods=1
-                        ).mean()
-                    )
-                    new_columns[col_mean] = roll.astype(DTYPE)
+                    new_columns[col_mean] = group_obj.transform(
+                        lambda x: x.rolling(window=window_size, min_periods=1).mean()
+                    ).astype(DTYPE)
 
-                if col_std not in df.columns:
-                    roll_std = df.groupby('station')[var].transform(
-                        lambda x: x.rolling(
-                            window=window_size, min_periods=2
-                        ).std()
-                    )
-                    new_columns[col_std] = roll_std.fillna(0).astype(DTYPE)
-                
-                if col_median not in df.columns:
-                    roll_median = df.groupby('station')[var].transform(
-                        lambda x: x.rolling(
-                            window=window_size, min_periods=1
-                        ).median()
-                    )
-                    new_columns[col_median] = roll_median.fillna(0).astype(DTYPE)
-
-                if f'{var}_roll_min_{window_name}' not in df.columns:
-                    roll_min = df.groupby('station')[var].transform(
-                        lambda x: x.rolling(window=window_size, min_periods=1).min()
-                    )
-                    new_columns[f'{var}_roll_min_{window_name}'] = roll_min.fillna(0).astype(DTYPE)
-
-                if f'{var}_roll_max_{window_name}' not in df.columns:
-                    roll_max = df.groupby('station')[var].transform(
-                        lambda x: x.rolling(window=window_size, min_periods=1).max()
-                    )
-                    new_columns[f'{var}_roll_max_{window_name}'] = roll_max.fillna(0).astype(DTYPE)
-
-                # Linear trend proxy: (current - window_start) / window_size
+                # SLOPE: Captures trends/ramps
                 col_slope = f'{var}_roll_slope_{window_name}'
                 if col_slope not in df.columns:
-                    shift_val = df.groupby('station')[var].shift(window_size)
-                    slope = (df[var] - shift_val) / window_size
-                    new_columns[col_slope] = slope.fillna(0).astype(DTYPE)
+                    # vectorized: (current - lag) / window
+                    shifted = group_obj.shift(window_size)
+                    new_columns[col_slope] = ((df[var] - shifted) / window_size).fillna(0).astype(DTYPE)
 
-        # ----------------------------------------------------------
-        # 1.5. Wavelet Proxies (Multi-scale differences)
-        # ----------------------------------------------------------
-        for var in ['temperature', 'relativehumidity', 'clear_sky_ghi']:
-            if var in df.columns:
-                # 1h (4 steps), 3h (12 steps), 6h (24 steps) differences
-                for lag, lag_name in [(4, '1h'), (12, '3h'), (24, '6h')]:
-                    col_diff = f'{var}_diff_{lag_name}'
-                    if col_diff not in df.columns:
-                        diff = df.groupby('station')[var].diff(periods=lag)
-                        new_columns[col_diff] = diff.fillna(0).astype(DTYPE)
+                # STD: Only for volatility-sensitive variables
+                if var in ['clear_sky_ghi', 'dewpoint_depression', 'cos_zenith']:
+                    col_std = f'{var}_roll_std_{window_name}'
+                    if col_std not in df.columns:
+                        new_columns[col_std] = group_obj.transform(
+                            lambda x: x.rolling(window=window_size, min_periods=2).std()
+                        ).fillna(0).astype(DTYPE)
+
+        # Wavelet Proxies removed (redundant with Slope)
 
         # ----------------------------------------------------------
         # 2. Clear-sky Volatility Index (rolling std of clearness proxy)
@@ -344,21 +312,21 @@ def compute_temporal_features(df: pd.DataFrame,
             grad_x_df = pd.DataFrame(grad_x, index=kt_pivot.index, columns=station_names)
             grad_y_df = pd.DataFrame(grad_y, index=kt_pivot.index, columns=station_names)
             
-            grad_x_melt = grad_x_df.reset_index().melt(id_vars='timestamp', value_name='grad_x', var_name='station')
-            grad_y_melt = grad_y_df.reset_index().melt(id_vars='timestamp', value_name='grad_y', var_name='station')
+            # Use stack() to align with MultiIndex (timestamp, station)
+            # This is much faster and more memory-efficient than a full merge
+            grad_x_series = grad_x_df.stack().reorder_levels(['station', 'timestamp']).sort_index()
+            grad_y_series = grad_y_df.stack().reorder_levels(['station', 'timestamp']).sort_index()
             
-            # Merge back safely
-            # Since df is sorted by station, timestamp, we need to match the sorting or just merge
-            # Merging 1.3M rows takes a few seconds.
-            temp_merge = df[['timestamp', 'station']].merge(grad_x_melt, on=['timestamp', 'station'], how='left')
-            temp_merge = temp_merge.merge(grad_y_melt, on=['timestamp', 'station'], how='left')
+            # Ensure df is indexed correctly for assignment
+            df_idx = df.set_index(['station', 'timestamp']).index
             
-            # Compute advection = - (u * dx + v * dy)
-            # u10 is eastward (positive x), v10 is northward (positive y)
+            # Map back to original dataframe structure
+            # reindex handles missing timestamps safely
             new_columns['advection_kt'] = (
-                - (df['u10'].values * temp_merge['grad_x'].values + df['v10'].values * temp_merge['grad_y'].values)
+                - (df['u10'].values * grad_x_series.reindex(df_idx).values + 
+                   df['v10'].values * grad_y_series.reindex(df_idx).values)
             ).astype(DTYPE)
-            print("  Cloud Advection computed.")
+            print("  Cloud Advection computed (optimized).")
 
         # ----------------------------------------------------------
         # Assign all new columns at once
