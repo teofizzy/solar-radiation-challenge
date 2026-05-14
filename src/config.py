@@ -52,7 +52,14 @@ elif IS_KAGGLE:
         # Fallback to current working directory
         LOCAL_DATA_DIR = os.getcwd()
 else:
-    PROJECT_DIR = os.path.join(os.environ.get("SCRATCH"), "challenges/zindi/solar-radiation-challenge")
+    # Use SCRATCH if available, otherwise fallback to current directory
+    scratch_base = os.environ.get("SCRATCH")
+    if scratch_base:
+        PROJECT_DIR = os.path.join(scratch_base, "challenges/zindi/solar-radiation-challenge")
+    else:
+        # Local development fallback: use absolute path of the directory containing this file's parent
+        PROJECT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+        
     LOCAL_DATA_DIR = os.path.join(PROJECT_DIR, 'data')
 
 PATHS = {

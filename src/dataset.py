@@ -29,8 +29,7 @@ PHYSICS_FEATURES = [
     'dewpoint_depression', 'pw_attenuation', 'turbidity_proxy',
     'hour_sin', 'hour_cos', 'hour_12_sin', 'hour_12_cos', 
     'hour_6_sin', 'hour_6_cos',
-    'doy_sin', 'doy_cos', 'days_since_start',
-    'csghi_terrain_corr'
+    'doy_sin', 'doy_cos', 'days_since_start'
 ]
 
 # Use log_precipitation instead of raw precipitation (z-range 62 -> ~5)
@@ -63,7 +62,7 @@ def get_feature_columns(df: pd.DataFrame) -> list:
     # Add any temporal rolling columns
     rolling_cols = [c for c in df.columns if '_roll_' in c or '_diff_' in c or
                     c in ('volatility_index', 'hours_since_wash',
-                          'sticky_dust_index')]
+                          'sticky_dust_index', 'advection_kt')]
     candidates += sorted(rolling_cols)
 
     # Add satellite lag stacks (e.g., mdssf_lag_1, kt_landsaf_lag_4)
@@ -235,10 +234,10 @@ class SolarDataset(Dataset):
             train_data = df[feature_cols]
 
         # Robust Scaling: center on median, scale by IQR
-        self.mean = train_data.median().values.astype(np.float32)
-        q25 = train_data.quantile(0.25).values.astype(np.float32)
-        q75 = train_data.quantile(0.75).values.astype(np.float32)
-        self.std = (q75 - q25).values.astype(np.float32)
+        self.mean = train_data.median().to_numpy().astype(np.float32)
+        q25 = train_data.quantile(0.25).to_numpy().astype(np.float32)
+        q75 = train_data.quantile(0.75).to_numpy().astype(np.float32)
+        self.std = (q75 - q25).astype(np.float32)
         
         # Prevent division by zero; use 1.0 for constant or binary features
         self.std = np.where(self.std < 1e-6, 1.0, self.std)

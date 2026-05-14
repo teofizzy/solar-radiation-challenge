@@ -33,111 +33,77 @@ def fix_coords(ds: xr.Dataset) -> xr.Dataset:
     return ds
 
 
-def extract_era5_for_station(ds, station_id: str, lat: float, lon: float,
+def extract_era5_for_station(ds: xr.Dataset, station_id: str, lat: float, lon: float,
                              target_timestamps: pd.Series) -> pd.DataFrame:
     """
-    Extract ERA5 variables for a single station and PCHIP-interpolate to 15-min.
-
-    Parameters
-    ----------
-    ds : xr.Dataset
-        ERA5 dataset (single year or month).
-    station_id : str
-        Station identifier.
-    lat, lon : float
-        Station coordinates.
-    target_timestamps : pd.Series
-        15-minute timestamps to interpolate to.
-
-    Returns
-    -------
-    pd.DataFrame with ERA5 variables at 15-minute cadence.
+    Extract ERA5 variables for a single station and interpolate to 15-min cadence.
     """
     # 1. Robust Longitude Normalization
-    # Detect convention: [0, 360] vs [-180, 180]
     ds_lon_min = float(ds.longitude.min())
     ds_lon_max = float(ds.longitude.max())
     
     if ds_lon_min >= 0 and lon < 0:
-        # Dataset is 0..360, point is -180..180 -> shift point to 0..360
         lon = lon % 360
     elif ds_lon_max <= 180 and lon > 180:
-        # Dataset is -180..180, point is 0..360 -> shift point to -180..180
         lon = (lon + 180) % 360 - 180
 
-    # 2. Standardize naming
+    # 2. Standardize naming and FORCE SORTING
     ds = fix_coords(ds)
+    ds = ds.sortby(['latitude', 'longitude'])
     
-    # 3. Extract nearest grid point (bilinear interpolation)
-    # Use method='linear' for smoothness, but nearest fallback if interp fails
+    # 3. Robust Temporal Alignment
+    # Ensure target_timestamps are naive UTC
+    target_timestamps = pd.to_datetime(target_timestamps)
+    if hasattr(target_timestamps, 'dt'):
+        target_timestamps = target_timestamps.dt.tz_localize(None)
+    else:
+        target_timestamps = target_timestamps.tz_localize(None)
+    
     try:
-        # Ensure we are within bounds to avoid interp NaNs
-        lat_min, lat_max = float(ds.latitude.min()), float(ds.latitude.max())
-        lon_min, lon_max = float(ds.longitude.min()), float(ds.longitude.max())
-        
-        # Clip to bounds slightly to avoid edge NaNs
-        lat_query = np.clip(lat, lat_min + 0.01, lat_max - 0.01)
-        lon_query = np.clip(lon, lon_min + 0.01, lon_max - 0.01)
-        
-        ds_point = ds.interp(latitude=lat_query, longitude=lon_query, method='linear')
-    except Exception as e:
-        print(f"  [FEATURE_ERA5] Interpolation failed for {station_id}: {e}. Falling back to nearest.")
+        # A. Spatial selection FIRST (nearest)
         ds_point = ds.sel(latitude=lat, longitude=lon, method='nearest')
-
-    # Select only the variables we need
-    available_vars = [v for v in ERA5_VARS if v in ds_point.data_vars]
-    if not available_vars:
-        return pd.DataFrame()
-
-    ds_point = ds_point[available_vars].compute()
-
-    # Convert to DataFrame
-    df_era = ds_point.to_dataframe()
-
-    # Handle multi-index if expver dimension exists
-    if isinstance(df_era.index, pd.MultiIndex):
-        df_era = df_era.reset_index()
-        if 'expver' in df_era.columns:
-            # Take mean across expver (ERA5 vs ERA5T overlap)
-            time_col = [c for c in df_era.columns if 'time' in c.lower()
-                        or c == 'valid_time'][0]
-            df_era = df_era.groupby(time_col)[available_vars].mean()
-        else:
-            time_col = [c for c in df_era.columns if 'time' in c.lower()
-                        or c == 'valid_time'][0]
+        
+        # B. Handle variables and expver
+        available_vars = [v for v in ERA5_VARS if v in ds_point.data_vars]
+        if not available_vars:
+            return pd.DataFrame(index=target_timestamps)
+        
+        ds_point = ds_point[available_vars]
+        if 'expver' in ds_point.dims:
+            ds_point = ds_point.sel(expver=1).combine_first(ds_point.sel(expver=5))
+            
+        # C. Compute and convert to DataFrame
+        df_era = ds_point.compute().to_dataframe()
+        
+        # D. Ensure DatetimeIndex
+        if isinstance(df_era.index, pd.MultiIndex):
+            df_era = df_era.reset_index()
+            time_col = [c for c in df_era.columns if 'time' in c.lower() or c == 'valid_time'][0]
             df_era = df_era.set_index(time_col)
+        
+        df_era.index = pd.to_datetime(df_era.index).tz_localize(None)
+        # Remove duplicates and sort
+        df_era = df_era[~df_era.index.duplicated(keep='first')].sort_index()
+        
+        # E. Reindex and Interpolate
+        # Unionize original ERA5 timestamps with target timestamps to ensure PCHIP has anchor points
+        all_timestamps = df_era.index.union(target_timestamps).sort_values()
+        df_full = df_era[available_vars].reindex(all_timestamps)
+        
+        # Interpolate across the full unionized index
+        df_full = df_full.interpolate(method='pchip', limit_direction='both')
+        
+        # Select ONLY the target timestamps
+        df_final = df_full.loc[target_timestamps]
+        
+        # Final safety: fill any remaining NaNs at edges
+        df_final = df_final.ffill().bfill()
+        
+        return df_final.astype(DTYPE)
 
-    # Ensure sorted, no duplicates
-    df_era = df_era[~df_era.index.duplicated(keep='first')].sort_index()
-
-    if len(df_era) < 2:
-        return pd.DataFrame()
-
-    # ERA5 timestamps as seconds since epoch
-    era_times = df_era.index.astype(np.int64).values / 1e9
-    # Target timestamps as seconds since epoch
-    target_times = target_timestamps.astype(np.int64).values / 1e9
-
-    # PCHIP interpolation per variable
-    result = pd.DataFrame({'timestamp': target_timestamps})
-
-    for var in available_vars:
-        values = df_era[var].values
-
-        # Fill small internal gaps via linear interpolation
-        s = pd.Series(values)
-        s = s.interpolate(method='linear', limit_direction='both')
-        y_known = s.values
-
-        if np.all(np.isnan(y_known)):
-            result[var] = np.float32(np.nan)
-            continue
-
-        # PCHIP preserves monotonicity, avoids thermodynamic overshoots
-        interp = PchipInterpolator(era_times, y_known, extrapolate=False)
-        result[var] = interp(target_times).astype(DTYPE)
-
-    return result
+    except Exception as e:
+        print(f"  [FEATURE_ERA5] Error extracting {station_id}: {e}")
+        return pd.DataFrame(index=target_timestamps, columns=ERA5_VARS).astype(DTYPE)
 
 
 def compute_era5_features(df: pd.DataFrame,
