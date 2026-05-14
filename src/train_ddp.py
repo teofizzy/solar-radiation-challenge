@@ -87,7 +87,10 @@ def train_model_ddp(dataset, feature_cols: list, val_months: list = None,
                 config=HPARAMS,
                 reinit='allow'
             )
-        HPARAMS.update(dict(wandb.config))
+        # Strict HPARAMS update to prevent silent field creation
+        for k, v in wandb.config.items():
+            if k in HPARAMS:
+                HPARAMS[k] = v
 
     # Split into train/val
     train_indices, val_indices = get_train_val_indices(dataset, val_months)

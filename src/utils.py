@@ -162,3 +162,36 @@ def clean_memory():
             torch.cuda.empty_cache()
     except ImportError:
         pass
+
+
+def enforce_schema(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Ensure 'timestamp' is a column and correctly typed across all pipeline stages.
+    Enforces canonical naming and avoids index-vs-column confusion.
+    """
+    df = df.copy()
+    
+    # 1. Handle timestamp in index
+    if df.index.name == "timestamp" or "timestamp" not in df.columns:
+        df = df.reset_index()
+        
+    # 2. Ensure column exists (might have been named 'time' or 'valid_time')
+    if "timestamp" not in df.columns:
+        # Check for synonyms
+        synonyms = ["time", "valid_time", "Datetime", "date"]
+        for syn in synonyms:
+            if syn in df.columns:
+                df = df.rename(columns={syn: "timestamp"})
+                break
+                
+    if "timestamp" not in df.columns:
+        raise KeyError("Could not find 'timestamp' or suitable synonym in DataFrame columns.")
+
+    # 3. Canonical conversion
+    df["timestamp"] = pd.to_datetime(df["timestamp"]).dt.tz_localize(None)
+    
+    # 4. Standardize station names/types if present
+    if "station" in df.columns:
+        df["station"] = df["station"].astype(str)
+        
+    return df

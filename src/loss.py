@@ -77,10 +77,13 @@ class ZindiSolarLoss(nn.Module):
         # Zindi composite: 0.5 * RMSE + 0.5 * |MBE|
         zindi_composite = 0.5 * rmse + 0.5 * abs_mbe
         
-        # 4. Scale GHI loss to roughly match delta_kt scale for balanced gradients
-        # RMSE is ~50-200 W/m2, LogCosh(dkt) is ~0.01-0.5
-        # Scale factor of 1/100 brings them to comparable magnitude
-        scaled_zindi = zindi_composite / 100.0
+        # 4. Balanced Gradient Scaling
+        # We target LogCosh(dkt) ~0.1-0.5 and GHI metrics ~50-200.
+        # Use an adaptive normalization factor based on clear-sky magnitude
+        # to prevent gradients from exploding at noon or vanishing at dawn.
+        # Default weight ratio (0.4/0.6) already favors GHI slightly.
+        ghi_norm = torch.mean(clear_sky_ghi[day_mask]) + 1e-6
+        scaled_zindi = zindi_composite / ghi_norm
         
         # 5. Total weighted loss
         total_loss = self.dkt_weight * loss_dkt + self.zindi_weight * scaled_zindi

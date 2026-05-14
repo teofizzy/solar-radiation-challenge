@@ -240,6 +240,7 @@ class SolarDataset(Dataset):
         self.std = (q75 - q25).astype(np.float32)
         
         # Prevent division by zero; use 1.0 for constant or binary features
+        # Weather data can have zero variance in small windows/batches
         self.std = np.where(self.std < 1e-6, 1.0, self.std)
 
         print(f"  [SCALER] Global Robust Scaling (Median/IQR) active for {len(feature_cols)} features.")

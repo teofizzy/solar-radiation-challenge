@@ -112,7 +112,11 @@ def extract_era5_for_station(ds: xr.Dataset, station_id: str, lat: float, lon: f
         # Final safety: fill any remaining NaNs at edges
         df_final = df_final.ffill().bfill()
         
-        return df_final.astype(DTYPE)
+        # Ensure 'timestamp' is a column for merging
+        df_final.index.name = 'timestamp'
+        df_final = df_final.reset_index()
+        
+        return df_final.astype({c: DTYPE for c in df_final.columns if c != 'timestamp'})
 
     except Exception as e:
         print(f"  [FEATURE_ERA5] Error extracting {station_id}: {e}")
@@ -250,6 +254,11 @@ def compute_era5_features(df: pd.DataFrame,
             df_era5 = pd.concat(all_era5_dfs, ignore_index=True)
             del all_era5_dfs
             clean_memory()
+            
+            # ENSURE SCHEMA BEFORE MERGE (Critical Fix)
+            from src.utils import enforce_schema
+            df_era5 = enforce_schema(df_era5)
+            df = enforce_schema(df)
 
             # Merge on station + timestamp
             era5_merge_cols = ['station', 'timestamp'] + \

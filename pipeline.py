@@ -159,11 +159,15 @@ def build_pipeline_data():
     # 6. Dataset Construction (Phase A.4)
     # ------------------------------------------------------------------
     from src.dataset import get_feature_columns
+    from src.utils import enforce_schema
 
     print("\n" + "=" * 70)
     print("PHASE A.4: Dataset Construction")
     print("=" * 70)
 
+    # FINAL SCHEMA ENFORCEMENT
+    df = enforce_schema(df)
+    
     feature_cols = get_feature_columns(df)
     print(f"  Feature columns ({len(feature_cols)}): {feature_cols}")
     
