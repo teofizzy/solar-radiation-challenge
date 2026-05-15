@@ -77,16 +77,15 @@ class ZindiSolarLoss(nn.Module):
         # Zindi composite: 0.5 * RMSE + 0.5 * |MBE|
         zindi_composite = 0.5 * rmse + 0.5 * abs_mbe
         
-        # 4. Balanced Gradient Scaling
-        # We target LogCosh(dkt) ~0.1-0.5 and GHI metrics ~50-200.
-        # Use an adaptive normalization factor based on clear-sky magnitude
-        # to prevent gradients from exploding at noon or vanishing at dawn.
-        # Default weight ratio (0.4/0.6) already favors GHI slightly.
-        ghi_norm = torch.mean(clear_sky_ghi[day_mask]) + 1e-6
-        scaled_zindi = zindi_composite / ghi_norm
+        # 4. MBE Amplifier
+        # Penalize the sign of mean bias to force the model to correct drift
+        # sign_loss captures the direction of systematic error
+        sign_loss = mbe  # differentiable, not abs — pushes toward zero mean
         
         # 5. Total weighted loss
-        total_loss = self.dkt_weight * loss_dkt + self.zindi_weight * scaled_zindi
+        total_loss = (self.dkt_weight * loss_dkt 
+                      + self.zindi_weight * zindi_composite 
+                      + 0.1 * sign_loss)
         
         metrics = {
             'loss': total_loss.item(),

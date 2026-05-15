@@ -179,6 +179,21 @@ class SolarDataset(Dataset):
                 center_kt_landsaf = st_df['kt_landsaf'].values.astype(np.float32)
             else:
                 center_kt_landsaf = np.full(n_rows, np.nan, dtype=np.float32)
+                
+            # Atmospheric features for dynamic attention
+            if 'wind_speed' in st_df.columns:
+                wind_speed = st_df['wind_speed'].values.astype(np.float32)
+                wind_dir = st_df['wind_direction_sin'].values.astype(np.float32)
+                tcwv = st_df['tcwv'].fillna(0).values.astype(np.float32)
+            else:
+                wind_speed = np.zeros(n_rows, dtype=np.float32)
+                wind_dir = np.zeros(n_rows, dtype=np.float32)
+                tcwv = np.zeros(n_rows, dtype=np.float32)
+                
+            if 'tropomi_cloud' in st_df.columns:
+                cloud_frac = st_df['tropomi_cloud'].fillna(0).values.astype(np.float32)
+            else:
+                cloud_frac = np.zeros(n_rows, dtype=np.float32)
 
             # Raw radiation target
             if 'radiation' in st_df.columns:
@@ -213,6 +228,10 @@ class SolarDataset(Dataset):
                     'is_test': st_df['is_test'].iloc[center],
                     'year': st_df['year'].iloc[center],
                     'month': st_df['month'].iloc[center],
+                    'wind_speed_center': wind_speed[center],
+                    'wind_dir_center': wind_dir[center],
+                    'tcwv_center': tcwv[center],
+                    'cloud_frac_center': cloud_frac[center],
                 })
 
         # Compute or load normalization statistics
@@ -292,6 +311,12 @@ class SolarDataset(Dataset):
             'center_kt_landsaf': torch.tensor(sample['center_kt_landsaf'], dtype=torch.float32),
             'is_test': torch.tensor(sample['is_test'], dtype=torch.uint8),
             'sample_id': sample['sample_id'],
+            'atmos_feats': torch.tensor([
+                sample['wind_speed_center'],
+                sample['wind_dir_center'],
+                sample['tcwv_center'],
+                sample['cloud_frac_center']
+            ], dtype=torch.float32),
         }
 
 
@@ -325,23 +350,15 @@ def create_train_val_datasets(df: pd.DataFrame, feature_cols: list,
     
     # We actually don't need a val_mask here if we rely on `get_train_val_indices` 
     # in train.py to do the splitting. We just pass the dataset.
-    df_train = df.copy()
-    df_val = df.copy()
-
-    # But we need the full temporal context (including test rows) for windowing
-    # So we pass full station data but mark which rows are trainable
-    df_train = df.copy()
-    df_val = df.copy()
 
     # For training dataset: only include samples where center has valid target
     # and center is in a training month
     print(f"\n[DATASET] Creating temporal CV split (val_year={val_year})...")
-    print(f"  Train targets: {train_mask.sum():,}")
-    print(f"  Val targets:   {val_mask.sum():,}")
+    print(f"  Total rows with target: {has_target.sum():,}")
 
     # Create train dataset (all data for windowing, but only train targets)
     train_dataset = SolarDataset(
-        df_train, feature_cols, is_train=True, scaler_stats=None
+        df, feature_cols, is_train=True, scaler_stats=None
     )
 
     # Filter train dataset samples to only training targets
@@ -366,7 +383,7 @@ def create_train_val_datasets(df: pd.DataFrame, feature_cols: list,
 
     # Create val dataset with same scaler
     val_dataset = SolarDataset(
-        df_val, feature_cols, is_train=False, scaler_stats=scaler_stats
+        df, feature_cols, is_train=False, scaler_stats=scaler_stats
     )
 
     return train_dataset, val_dataset, scaler_stats

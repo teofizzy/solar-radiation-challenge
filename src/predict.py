@@ -90,14 +90,14 @@ def predict(dataset, models=None, model_paths: list = None,
             clear_sky = batch['clear_sky_ghi'].to(device)
             is_night = batch['is_night'].to(device)
             center_kt_landsaf = batch['center_kt_landsaf'].to(device)
+            atmos_feats = batch['atmos_feats'].to(device)
             is_test = batch['is_test'].numpy()
             sample_ids = batch['sample_id']
 
             ensemble_ghi = []
             
             for m in models:
-                with torch.amp.autocast('cuda', enabled=(device.type == 'cuda')):
-                    _, ghi_pred = m(x, station_idx, diag_vector, clear_sky, is_night, center_kt_landsaf)
+                _, ghi_pred = m(x, station_idx, diag_vector, clear_sky, is_night, center_kt_landsaf, atmos_feats)
                 ensemble_ghi.append(ghi_pred.cpu().numpy())
                 
             # Average across the ensemble

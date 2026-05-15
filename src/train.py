@@ -210,14 +210,14 @@ def train_model(dataset, feature_cols: list, val_months: list = None,
             target_ghi = batch['target_ghi'].to(device)
             target_delta_kt = batch['target_delta_kt'].to(device)
             center_kt_landsaf = batch['center_kt_landsaf'].to(device)
+            atmos_feats = batch['atmos_feats'].to(device)
 
             diag_vector = batch['diag_vector'].to(device)
 
             optimizer.zero_grad(set_to_none=True)
 
-            with torch.amp.autocast('cuda', enabled=(device.type == 'cuda')):
-                delta_kt_pred, ghi_pred = model(x, station_idx, diag_vector, clear_sky, is_night, center_kt_landsaf)
-                loss, loss_dict = criterion(delta_kt_pred, ghi_pred, target_delta_kt, target_ghi, is_night, clear_sky)
+            delta_kt_pred, ghi_pred = model(x, station_idx, diag_vector, clear_sky, is_night, center_kt_landsaf, atmos_feats)
+            loss, loss_dict = criterion(delta_kt_pred, ghi_pred, target_delta_kt, target_ghi, is_night, clear_sky)
 
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
@@ -251,11 +251,11 @@ def train_model(dataset, feature_cols: list, val_months: list = None,
                 is_night = batch['is_night'].to(device)
                 target_ghi = batch['target_ghi']
                 center_kt_landsaf = batch['center_kt_landsaf'].to(device)
+                atmos_feats = batch['atmos_feats'].to(device)
 
                 diag_vector = batch['diag_vector'].to(device)
 
-                with torch.amp.autocast('cuda', enabled=(device.type == 'cuda')):
-                    delta_kt_pred, ghi_pred = model(x, station_idx, diag_vector, clear_sky, is_night, center_kt_landsaf)
+                delta_kt_pred, ghi_pred = model(x, station_idx, diag_vector, clear_sky, is_night, center_kt_landsaf, atmos_feats)
 
                 val_preds.extend(ghi_pred.cpu().numpy())
                 val_targets.extend(target_ghi.numpy())

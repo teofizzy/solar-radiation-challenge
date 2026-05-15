@@ -23,9 +23,10 @@ class DiagnosticEncoder(nn.Module):
 
 class PatchEmbedding(nn.Module):
     """Projects patches of time-series into a latent space."""
-    def __init__(self, in_channels, patch_len, d_model):
+    def __init__(self, in_channels, patch_len, stride, d_model):
         super().__init__()
         self.patch_len = patch_len
+        self.stride = stride
         self.proj = nn.Linear(in_channels * patch_len, d_model)
         self.norm = nn.LayerNorm(d_model)
 
@@ -36,7 +37,7 @@ class PatchEmbedding(nn.Module):
         
         # Reshape to patches: (B, T/P, P*F)
         # Corrected unfold logic: (B, n_patches, F, P) -> (B, n_patches, P, F) -> (B, n_patches, P*F)
-        x = x.unfold(1, P, P) # (B, n_patches, F, P)
+        x = x.unfold(1, P, self.stride) # (B, n_patches, F, P)
         x = x.transpose(2, 3).contiguous() # (B, n_patches, P, F)
         x = x.view(B, -1, P * F)
         
@@ -54,13 +55,15 @@ class PhysicsInformedPatchTransformer(nn.Module):
         self.stride = stride
         
         # 1. Patch Embedding
-        self.patch_embed = PatchEmbedding(n_features, patch_len, d_model)
+        self.patch_embed = PatchEmbedding(n_features, patch_len, stride, d_model)
         
         # 2. Diagnostic Encoder
         self.diag_encoder = DiagnosticEncoder(in_dim=5, out_dim=32)
         
         # 3. Position Encoding (Learnable)
-        self.pos_embed = nn.Parameter(torch.zeros(1, (HPARAMS['seq_len'] // patch_len), d_model))
+        n_patches = (HPARAMS['seq_len'] - patch_len) // stride + 1
+        self.n_patches = n_patches
+        self.pos_embed = nn.Parameter(torch.zeros(1, n_patches, d_model))
         
         # 4. Temporal Transformer
         encoder_layer = nn.TransformerEncoderLayer(
@@ -80,6 +83,13 @@ class PhysicsInformedPatchTransformer(nn.Module):
         # Bounds cosine similarity [-1, 1] to a broader range before softmax.
         # Initialize at log(10) ~ 2.3
         self.logit_scale = nn.Parameter(torch.ones([]) * np.log(10.0))
+
+        # 8. Atmospheric Gate for dynamic spatial attention
+        self.atmos_gate = nn.Sequential(
+            nn.Linear(4, d_model),
+            nn.GELU(),
+            nn.Linear(d_model, d_model)
+        )
         
         # 8. Fusion & Output Heads
         self.fusion = nn.Linear(d_model + 32, d_model)
@@ -112,7 +122,7 @@ class PhysicsInformedPatchTransformer(nn.Module):
         return torch.zeros(n_stations, n_stations)
 
     def forward(self, x, station_idx, diag_vector,
-                clear_sky_ghi, is_night, center_kt_landsaf):
+                clear_sky_ghi, is_night, center_kt_landsaf, atmos_feats):
         
         B = x.shape[0]
         
@@ -136,9 +146,14 @@ class PhysicsInformedPatchTransformer(nn.Module):
         # 3. Diagnostic Embedding
         z_diag = self.diag_encoder(diag_vector) # (B, 32)
         
+        # 4. Atmospheric Modulation of Query
+        # Add atmospheric condition to the query tokens
+        atmos_embed = self.atmos_gate(atmos_feats).unsqueeze(1) # (B, 1, d_model)
+        z_query = z_temp + atmos_embed
+        
         # query: (B, tokens, d_model), key/value: (B, 40, d_model)
         # Normalizing query and key converts matmul to cosine similarity.
-        query = F.normalize(z_temp, dim=-1) 
+        query = F.normalize(z_query, dim=-1) 
         key = F.normalize(self.station_memory, dim=-1).unsqueeze(0).expand(B, -1, -1) 
         
         # scores: (B, tokens, 40)

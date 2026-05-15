@@ -113,38 +113,14 @@ def extract_era5_for_station(ds: xr.Dataset, station_id: str, lat: float, lon: f
         df_final = df_final.ffill().bfill()
         
         # F. Terrain Corrections (Lapse Rate & Hypsometry)
-        # ------------------------------------------------------------------
-        # Get station elevation
-        from src.config import get_station_meta
-        meta = get_station_meta()
-        h_station = float(meta.loc[meta['station'] == station_id, 'elevation'].iloc[0])
-        
-        # 1. Temperature Lapse Rate Correction
-        # Formula: T_st = T_2m - 0.0065 * (H_st - H_era)
-        # H_era = Z / 9.80665
-        if 't2m' in df_final.columns and 'z' in df_final.columns:
-            h_era = df_final['z'] / 9.80665
-            df_final['t_lapse_corr'] = df_final['t2m'] - 0.0065 * (h_station - h_era)
-        else:
-            df_final['t_lapse_corr'] = df_final.get('t2m', np.nan)
-            
-        # 2. Pressure Hypsometric Correction
-        # Formula: P_st = P_surf * exp(-g * (H_st - H_era) / (R * T_mean))
-        if 'sp' in df_final.columns and 'z' in df_final.columns and 't2m' in df_final.columns:
-            g = 9.80665
-            R = 287.05
-            h_era = df_final['z'] / 9.80665
-            # Use T2m as an approximation for T_mean in the layer
-            df_final['p_hyps_corr'] = df_final['sp'] * np.exp(-g * (h_station - h_era) / (R * df_final['t2m']))
-        else:
-            df_final['p_hyps_corr'] = df_final.get('sp', np.nan)
+        # Note: These are now correctly applied in feature_physics.py to avoid duplication
+        # and to ensure they run after all raw features are extracted.
 
         # Indicator for successfully extracted data
         df_final['era5_missing'] = np.float32(0.0)
         
         # Ensure 'timestamp' is a column for merging
-        df_final.index.name = 'timestamp'
-        df_final = df_final.reset_index()
+        df_final = df_final.reset_index(names='timestamp')
         
         return df_final.astype({c: DTYPE for c in df_final.columns if c != 'timestamp'})
 
@@ -153,9 +129,7 @@ def extract_era5_for_station(ds: xr.Dataset, station_id: str, lat: float, lon: f
         # Structured fallback: return NaNs but preserve timestamp column and add missing flag
         fallback = pd.DataFrame({
             'timestamp': target_timestamps,
-            'era5_missing': np.float32(1.0),
-            't_lapse_corr': np.float32(np.nan),
-            'p_hyps_corr': np.float32(np.nan)
+            'era5_missing': np.float32(1.0)
         })
         for var in ERA5_VARS:
             fallback[var] = np.float32(np.nan)
@@ -216,11 +190,23 @@ def compute_era5_features(df: pd.DataFrame,
 
             if all_cached and not force_recompute:
                 print(f"  {year}: all stations cached, loading...")
+                year_valid = True
+                from src.utils import enforce_schema
                 for station_id in stations:
-                    cache_path = os.path.join(
-                        PATHS['cache_era5'], f'{station_id}_{year}.parquet')
-                    all_era5_dfs.append(pd.read_parquet(cache_path))
-                continue
+                    cache_path = os.path.join(PATHS['cache_era5'], f'{station_id}_{year}.parquet')
+                    cached_df = pd.read_parquet(cache_path)
+                    try:
+                        cached_df = enforce_schema(cached_df, source_name=f"ERA5_FAST_{station_id}_{year}")
+                        all_era5_dfs.append(cached_df)
+                    except Exception as e:
+                        print(f"  [FEATURE_ERA5] Cache invalid for {station_id}_{year}: {e}. Forcing recompute.")
+                        year_valid = False
+                        break
+                if year_valid:
+                    continue
+                # If invalid, fall through to full recompute for this year
+                # Filter out the invalid ones that might have just been appended
+                all_era5_dfs = [d for d in all_era5_dfs if d['year'].iloc[0] != year]
 
             # Load ERA5 for this year
             print(f"  {year}: loading ERA5 NetCDF files...")
@@ -324,8 +310,7 @@ def compute_era5_features(df: pd.DataFrame,
 
             # Validation
             print("\n[ERA5 VALIDATION]")
-            from src.dataset import ERA5_FEATURES
-            for var in ERA5_FEATURES:
+            for var in ERA5_VARS:
                 if var in df.columns:
                     n_nan = df[var].isna().sum()
                     pct = 100 * n_nan / len(df)

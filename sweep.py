@@ -21,6 +21,17 @@ import wandb
 import gc
 import numpy as np
 import torch
+import subprocess
+import hashlib
+
+def get_git_hash():
+    try:
+        return subprocess.check_output(['git', 'rev-parse', 'HEAD']).decode().strip()[:8]
+    except:
+        return 'unknown'
+
+def get_feature_hash(feature_cols):
+    return hashlib.md5(','.join(sorted(feature_cols)).encode()).hexdigest()[:8]
 
 # W&B Login will be handled in the __main__ block via --api_key or environment variables.
 
@@ -139,6 +150,14 @@ def run_sweep_agent(config=None):
         # Load Data AFTER HPARAMS update to ensure correct seq_len
         df, feature_cols = build_pipeline_data()
         dataset = SolarDataset(df, feature_cols, is_train=True, hparams=HPARAMS)
+        
+        # Log metadata for reproducibility
+        from src.config import SEED
+        wandb.log({
+            'meta/git_hash': get_git_hash(),
+            'meta/feature_hash': get_feature_hash(feature_cols),
+            'meta/seed': SEED,
+        })
         
         # Pull experiments_dir from PATHS (not HPARAMS)
         run_name = wandb.run.name
@@ -306,35 +325,20 @@ def get_default_sweep_config():
         },
         'early_terminate': {
             'type': 'hyperband',
-            'min_iter': 2,
-            'eta': 3,
-            'max_iter': 40
+            'min_iter': 5,
+            's': 2
         },
         'parameters': {
-            'lr': {
-                'distribution': 'log_uniform_values',
-                'min': 1e-5,
-                'max': 5e-3
-            },
-            'hidden_dim': {
-                'values': [128, 192, 256]
-            },
-            'n_layers': {
-                'values': [3, 4, 6]
-            },
-            'transformer_heads': {
-                'values': [4, 6, 8]
-            },
-            'dropout': {
-                'distribution': 'uniform',
-                'min': 0.1,
-                'max': 0.3
-            },
-            'weight_decay': {
-                'distribution': 'log_uniform_values',
-                'min': 1e-6,
-                'max': 1e-4
-            }
+            'patch_len':         {'values': [8, 12, 16]},
+            'stride':            {'values': [4, 6, 8]},
+            'hidden_dim':        {'values': [64, 128, 192]},
+            'n_layers':          {'values': [3, 4, 5]},
+            'transformer_heads': {'values': [4, 8]},
+            'dropout':           {'distribution': 'uniform', 'min': 0.05, 'max': 0.25},
+            'lr':                {'distribution': 'log_uniform_values', 'min': 5e-6, 'max': 5e-4},
+            'weight_decay':      {'distribution': 'log_uniform_values', 'min': 1e-6, 'max': 1e-3},
+            'dkt_weight':        {'values': [0.2, 0.4, 0.6]},
+            'zindi_weight':      {'values': [0.4, 0.6, 0.8]},
         }
     }
 
@@ -383,10 +387,10 @@ def start_sweep(resume_id: str = None, refine: bool = False, count: int = 40, ap
 
     # Initialize or join existing sweep
     # Priority: 1. CLI --resume, 2. Env WANDB_SWEEP_ID, 3. Create New
-    final_sweep_id = args.resume or os.environ.get("WANDB_SWEEP_ID")
+    final_sweep_id = resume_id or os.environ.get("WANDB_SWEEP_ID")
     
     if not final_sweep_id:
-        print(f"[SWEEP] Creating NEW sweep (Refine={args.refine})...")
+        print(f"[SWEEP] Creating NEW sweep (Refine={refine})...")
         final_sweep_id = wandb.sweep(
             sweep_config,
             project=WANDB_CONFIG['project'],
@@ -399,7 +403,7 @@ def start_sweep(resume_id: str = None, refine: bool = False, count: int = 40, ap
     full_sweep_id = normalize_sweep_id(final_sweep_id)
     print(f"[SWEEP] Agent joining: {full_sweep_id}")
     
-    wandb.agent(full_sweep_id, function=run_sweep_agent, count=args.count)
+    wandb.agent(full_sweep_id, function=run_sweep_agent, count=count)
     print("[SWEEP] Sweep completed.")
     
     # Print final global best

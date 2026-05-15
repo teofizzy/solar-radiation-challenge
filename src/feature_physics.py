@@ -45,12 +45,11 @@ def compute_physics_features(df: pd.DataFrame,
     physics_cols = [
         'air_mass', 'wind_speed', 'wind_direction_sin', 'wind_direction_cos',
         'dewpoint_depression', 'pw_attenuation', 'turbidity_proxy',
-        'hour_sin', 'hour_cos', 'hour_12_sin', 'hour_12_cos', 
-        'hour_6_sin', 'hour_6_cos', 'hour_3_sin', 'hour_3_cos',
-        'month_sin', 'month_cos', 'doy_sin', 'doy_cos', 'log_clearsky_ghi',
+        'hour_sin', 'hour_cos', 'month_sin', 'month_cos', 
         'log_precipitation', 'log_wind_speed',
         't2m_celsius', 'd2m_celsius', 'days_since_start',
-        't_lapse_corr', 'p_hyps_corr', 'csghi_terrain_corr'
+        't_lapse_corr', 'p_hyps_corr', 'csghi_terrain_corr',
+        'specific_humidity', 'tcwv_anomaly', 'pw_path'
     ]
 
     recompute = force_recompute
@@ -146,6 +145,16 @@ def compute_physics_features(df: pd.DataFrame,
             df['dewpoint_depression'] = np.float32(0.0)
 
         # ----------------------------------------------------------
+        # 3a. Specific Humidity (Magnus formula)
+        # ----------------------------------------------------------
+        if 'd2m' in df.columns and 'sp' in df.columns:
+            Td = df['d2m'].values - 273.15  # to Celsius
+            e_s = 611.2 * np.exp(17.67 * Td / (Td + 243.5))
+            df['specific_humidity'] = (0.622 * e_s / (df['sp'].values - 0.378 * e_s)).astype(DTYPE)
+        else:
+            df['specific_humidity'] = np.float32(0.0)
+
+        # ----------------------------------------------------------
         # 3b. Topographic Corrections (Temperature & Pressure)
         # ----------------------------------------------------------
         z_station = df['dem'].values if 'dem' in df.columns else df['elevation'].values
@@ -166,15 +175,26 @@ def compute_physics_features(df: pd.DataFrame,
             df['p_hyps_corr'] = np.float32(101325.0)
 
         # ----------------------------------------------------------
-        # 4. Precipitable water attenuation
+        # 4. Precipitable water features
         # pw_att = exp(-0.1 * AM * tcwv)
+        # pw_path = tcwv * AM
         # ----------------------------------------------------------
         if 'tcwv' in df.columns:
             tcwv = df['tcwv'].fillna(0).values
             am = df['air_mass'].values
             df['pw_attenuation'] = np.exp(-0.1 * am * tcwv / 1000.0).astype(DTYPE)
+            df['pw_path'] = (tcwv * am).astype(DTYPE)
+            
+            # tcwv anomaly captures unusual moisture intrusions
+            df['tcwv_anomaly'] = (
+                df['tcwv'] - df.groupby('station')['tcwv'].transform(
+                    lambda x: x.ewm(span=672, min_periods=1).mean()
+                )
+            ).astype(DTYPE)
         else:
             df['pw_attenuation'] = np.float32(1.0)
+            df['pw_path'] = np.float32(0.0)
+            df['tcwv_anomaly'] = np.float32(0.0)
 
         # ----------------------------------------------------------
         # 5. Turbidity proxy (atmospheric opacity indicator)
@@ -193,28 +213,15 @@ def compute_physics_features(df: pd.DataFrame,
 
         # ----------------------------------------------------------
         # 6. Cyclical time encoding (sin/cos)
-        # Higher frequencies (12h, 6h, 3h) help the Transformer capture sharp diurnal transitions
+        # ----------------------------------------------------------
         hour_frac = df['hour'].values + df['minute'].values / 60.0
         df['hour_sin'] = np.sin(2 * np.pi * hour_frac / 24.0).astype(DTYPE)
         df['hour_cos'] = np.cos(2 * np.pi * hour_frac / 24.0).astype(DTYPE)
-        
-        df['hour_12_sin'] = np.sin(2 * np.pi * hour_frac / 12.0).astype(DTYPE)
-        df['hour_12_cos'] = np.cos(2 * np.pi * hour_frac / 12.0).astype(DTYPE)
-        
-        df['hour_6_sin'] = np.sin(2 * np.pi * hour_frac / 6.0).astype(DTYPE)
-        df['hour_6_cos'] = np.cos(2 * np.pi * hour_frac / 6.0).astype(DTYPE)
-        
-        df['hour_3_sin'] = np.sin(2 * np.pi * hour_frac / 3.0).astype(DTYPE)
-        df['hour_3_cos'] = np.cos(2 * np.pi * hour_frac / 3.0).astype(DTYPE)
 
-        # Seasonal encoding: Monthly and Day-of-Year
+        # Seasonal encoding: Monthly
         month = df['month'].values.astype(np.float32)
         df['month_sin'] = np.sin(2 * np.pi * (month - 1) / 12.0).astype(DTYPE)
         df['month_cos'] = np.cos(2 * np.pi * (month - 1) / 12.0).astype(DTYPE)
-
-        doy = df['dayofyear'].values.astype(np.float32)
-        df['doy_sin'] = np.sin(2 * np.pi * doy / 365.25).astype(DTYPE)
-        df['doy_cos'] = np.cos(2 * np.pi * doy / 365.25).astype(DTYPE)
 
         # ----------------------------------------------------------
         # 6b. Terrain-Adjusted Clear Sky GHI
@@ -241,7 +248,6 @@ def compute_physics_features(df: pd.DataFrame,
         # ----------------------------------------------------------
         # 7. Log transforms for skewed variables
         # ----------------------------------------------------------
-        df['log_clearsky_ghi'] = np.log1p(df['csghi_terrain_corr'].values).astype(DTYPE)
 
         # Log-transform precipitation (extreme right-skew, z-range ~62 -> ~5)
         if 'precipitation' in df.columns:

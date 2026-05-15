@@ -165,11 +165,13 @@ def build_pipeline_data():
     print("PHASE A.4: Dataset Construction")
     print("=" * 70)
 
-    # FINAL SCHEMA ENFORCEMENT
-    df = enforce_schema(df, source_name="FINAL_PIPELINE_OUTPUT")
-    
     feature_cols = get_feature_columns(df)
+    
+    import hashlib
+    feat_hash = hashlib.md5(','.join(sorted(feature_cols)).encode()).hexdigest()[:8]
+    
     print(f"  Feature columns ({len(feature_cols)}): {feature_cols}")
+    print(f"  Feature Hash: {feat_hash}")
     
     return df, feature_cols
 

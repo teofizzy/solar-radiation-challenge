@@ -69,7 +69,7 @@ def train_model_ddp(dataset, feature_cols: list, val_months: list = None,
     world_size = dist.get_world_size()
     is_main = (local_rank == 0)
     
-    seed_everything(SEED + local_rank) # Unique seed per rank
+    seed_everything(SEED) # Consistent seed across all ranks
     ensure_dirs()
     device = torch.device(f'cuda:{local_rank}')
 
@@ -142,14 +142,14 @@ def train_model_ddp(dataset, feature_cols: list, val_months: list = None,
 
     optimizer = torch.optim.AdamW(
         model.parameters(),
-        lr=HPARAMS['lr'] * world_size, # Scale learning rate by world size
+        lr=HPARAMS['lr'], # Do not scale LR for AdamW
         weight_decay=HPARAMS['weight_decay'],
     )
 
     steps_per_epoch = len(train_loader)
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
         optimizer,
-        max_lr=HPARAMS['lr'] * world_size,
+        max_lr=HPARAMS['lr'],
         epochs=HPARAMS['epochs'],
         steps_per_epoch=steps_per_epoch,
         pct_start=0.12,
@@ -177,13 +177,13 @@ def train_model_ddp(dataset, feature_cols: list, val_months: list = None,
             target_ghi = batch['target_ghi'].to(device)
             target_delta_kt = batch['target_delta_kt'].to(device)
             center_kt_landsaf = batch['center_kt_landsaf'].to(device)
+            atmos_feats = batch['atmos_feats'].to(device)
             diag_vector = batch['diag_vector'].to(device)
 
             optimizer.zero_grad(set_to_none=True)
 
-            with torch.amp.autocast('cuda'):
-                delta_kt_pred, ghi_pred = model(x, station_idx, diag_vector, clear_sky, is_night, center_kt_landsaf)
-                loss, loss_dict = criterion(delta_kt_pred, ghi_pred, target_delta_kt, target_ghi, is_night, clear_sky)
+            delta_kt_pred, ghi_pred = model(x, station_idx, diag_vector, clear_sky, is_night, center_kt_landsaf, atmos_feats)
+            loss, loss_dict = criterion(delta_kt_pred, ghi_pred, target_delta_kt, target_ghi, is_night, clear_sky)
 
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
@@ -212,10 +212,10 @@ def train_model_ddp(dataset, feature_cols: list, val_months: list = None,
                 is_night = batch['is_night'].to(device)
                 target_ghi = batch['target_ghi'].to(device)
                 center_kt_landsaf = batch['center_kt_landsaf'].to(device)
+                atmos_feats = batch['atmos_feats'].to(device)
                 diag_vector = batch['diag_vector'].to(device)
 
-                with torch.amp.autocast('cuda'):
-                    _, ghi_pred = model(x, station_idx, diag_vector, clear_sky, is_night, center_kt_landsaf)
+                _, ghi_pred = model(x, station_idx, diag_vector, clear_sky, is_night, center_kt_landsaf, atmos_feats)
 
                 valid = ~torch.isnan(target_ghi)
                 if valid.any():

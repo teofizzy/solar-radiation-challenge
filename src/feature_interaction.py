@@ -35,6 +35,11 @@ def compute_interaction_features(df: pd.DataFrame) -> pd.DataFrame:
     if 'ewma_kt_fast' in df.columns and 'ewma_kt_slow' in df.columns:
         new_cols['clearness_regime_shift'] = (df['ewma_kt_fast'] - df['ewma_kt_slow']).astype(DTYPE)
 
+    # 4. Cloud Advection Potential (Dynamic wind-cloud interaction)
+    if 'wind_speed' in df.columns and 'kt_landsaf' in df.columns:
+        kt_grad = df.groupby('station')['kt_landsaf'].diff(4).fillna(0)
+        new_cols['cloud_advection_potential'] = (df['wind_speed'] * kt_grad.abs()).astype(DTYPE)
+
     # Assign new columns
     for col, values in new_cols.items():
         df[col] = values
