@@ -103,30 +103,42 @@ HPARAMS = {
     'half_window': 96,        # One side of the symmetric window
     
     # Patch-Transformer Architecture
-    'hidden_dim': 192,        # Unified d_model (T4 optimized)
+    'hidden_dim': 128,        # d_model (must be divisible by transformer_heads)
     'n_layers': 4,            # Number of Transformer layers
-    'transformer_heads': 6,   # Must divide hidden_dim
-    'dropout': 0.1,
+    'transformer_heads': 8,   # Must divide hidden_dim evenly
+    'dropout': 0.15,          # Slightly higher for regularization
     'patch_len': 16,          # 4-hour patches
     'stride': 8,              # 2-hour sliding stride
     'station_embed_dim': 32,  # Latent projection of diagnostic features
     
     # Training
     'batch_size': 32,
-    'lr': 1e-4,
+    'lr': 3e-4,               # Slightly higher LR for single-objective loss
     'weight_decay': 1e-4,
-    'patience': 10,
+    'patience': 15,           # Increased patience for slower convergence
     'epochs': 100,
     'grad_clip': 1.0,
 
-    # Loss weights (multi-task: auxiliary delta_kt + primary Zindi composite)
-    'dkt_weight': 0.4,
-    'zindi_weight': 0.6,
-
     # Physics & Constraints
-    'kt_max': 1.5,
+    'kt_max': 1.05,           # Physical kt upper bound (tightened from 1.5)
     'night_zenith_threshold': 90.0,
     'clearsky_min_denom': 1.0,
+    
+    # Phase 2: Curriculum Learning (clear-sky -> clouds -> all)
+    # Reference: Perplexity + Deep Search consensus: 3-8 W/m2 RMSE reduction
+    'use_curriculum': True,
+    'curriculum_warmup_frac': 0.30,   # Epochs 0-30%: clear-sky emphasis
+    'curriculum_medium_frac': 0.60,   # Epochs 30-60%: broken clouds
+    
+    # Phase 3: Loss Annealing (MSE -> Huber at switch_frac)
+    # Reference: ChatGPT consensus: 3-5 W/m2 RMSE reduction
+    'huber_delta_kt': 0.03,           # delta in kt-space (~20 W/m2 at noon)
+    'huber_switch_frac': 0.60,        # Switch from MSE to Huber at 60% epochs
+    
+    # Phase 4: Stochastic Weight Averaging (SWA)
+    # Reference: ChatGPT consensus: 2-5 W/m2 RMSE reduction
+    'use_swa': True,
+    'swa_lr_ratio': 0.1,              # SWA LR = lr * 0.1
 }
 
 # ------------------------------------------------------------------

@@ -316,7 +316,19 @@ def normalize_sweep_id(sweep_id: str):
 # Sweep Launcher
 # ------------------------------------------------------------------
 def get_default_sweep_config():
-    """Return the default (exploration) sweep configuration."""
+    """Return the default (exploration) sweep configuration.
+    
+    Divisibility guarantee:
+        hidden_dim in {128, 192, 256}
+        transformer_heads in {4, 8}
+        All combinations divide evenly:
+          128/4=32, 128/8=16, 192/4=48, 192/8=24, 256/4=64, 256/8=32
+    
+    Phase integration:
+        - Curriculum learning (on/off toggle)
+        - SWA (on/off toggle)
+        - Huber delta and switch fraction (continuous)
+    """
     return {
         'method': 'bayes',
         'metric': {
@@ -329,16 +341,27 @@ def get_default_sweep_config():
             's': 2
         },
         'parameters': {
+            # Architecture
             'patch_len':         {'values': [8, 12, 16]},
             'stride':            {'values': [4, 6, 8]},
-            'hidden_dim':        {'values': [64, 128, 192]},
-            'n_layers':          {'values': [3, 4, 5]},
+            'hidden_dim':        {'values': [128, 192, 256]},
+            'n_layers':          {'values': [3, 4, 6]},
             'transformer_heads': {'values': [4, 8]},
-            'dropout':           {'distribution': 'uniform', 'min': 0.05, 'max': 0.25},
-            'lr':                {'distribution': 'log_uniform_values', 'min': 5e-6, 'max': 5e-4},
+            'dropout':           {'distribution': 'uniform', 'min': 0.05, 'max': 0.30},
+            
+            # Optimization
+            'lr':                {'distribution': 'log_uniform_values', 'min': 5e-5, 'max': 1e-3},
             'weight_decay':      {'distribution': 'log_uniform_values', 'min': 1e-6, 'max': 1e-3},
-            'dkt_weight':        {'values': [0.2, 0.4, 0.6]},
-            'zindi_weight':      {'values': [0.4, 0.6, 0.8]},
+            
+            # Phase 2: Curriculum Learning
+            'use_curriculum':    {'values': [True, False]},
+            
+            # Phase 3: Loss Annealing (MSE -> Huber)
+            'huber_delta_kt':    {'distribution': 'uniform', 'min': 0.01, 'max': 0.08},
+            'huber_switch_frac': {'distribution': 'uniform', 'min': 0.40, 'max': 0.80},
+            
+            # Phase 4: SWA
+            'use_swa':           {'values': [True, False]},
         }
     }
 

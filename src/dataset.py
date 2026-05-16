@@ -167,6 +167,13 @@ class SolarDataset(Dataset):
             # Metadata at each timestep
             clear_sky = st_df['clear_sky_ghi'].values.astype(np.float32)
             is_night = st_df['is_night'].values.astype(np.int8)
+            
+            # cos_zenith at each timestep (for PISSM-inspired SZA gate)
+            if 'cos_zenith' in st_df.columns:
+                cos_zenith_arr = st_df['cos_zenith'].values.astype(np.float32)
+            else:
+                # Fallback: derive from is_night (1.0 for day, -0.5 for night)
+                cos_zenith_arr = np.where(is_night == 0, 0.5, -0.5).astype(np.float32)
 
             # Target: Delta kt = kt_obs - kt_landsaf (NaN for test rows)
             if 'kt' in st_df.columns and 'kt_landsaf' in st_df.columns:
@@ -221,6 +228,7 @@ class SolarDataset(Dataset):
                     'diag_vector': diag_tensor,
                     'clear_sky_ghi': clear_sky[center],
                     'is_night': is_night[center],
+                    'cos_zenith_center': cos_zenith_arr[center],
                     'target_delta_kt': target_delta_kt[center],
                     'target_ghi': target_ghi[center],
                     'center_kt_landsaf': center_kt_landsaf[center],
@@ -305,7 +313,7 @@ class SolarDataset(Dataset):
             'station_idx': torch.tensor(sample['station_idx'], dtype=torch.long),
             'diag_vector': torch.from_numpy(sample['diag_vector']),     # (5,)
             'clear_sky_ghi': torch.tensor(sample['clear_sky_ghi'], dtype=torch.float32),
-            'is_night': torch.tensor(sample['is_night'], dtype=torch.float32),
+            'cos_zenith': torch.tensor(sample['cos_zenith_center'], dtype=torch.float32),
             'target_delta_kt': torch.tensor(sample['target_delta_kt'], dtype=torch.float32),
             'target_ghi': torch.tensor(sample['target_ghi'], dtype=torch.float32),
             'center_kt_landsaf': torch.tensor(sample['center_kt_landsaf'], dtype=torch.float32),

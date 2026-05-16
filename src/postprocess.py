@@ -177,6 +177,91 @@ def apply_savgol_filter(kt_values, clear_sky_ghi=None,
     return kt_filtered
 
 
+def quantile_mapping(preds, true_train, preds_train, 
+                     n_quantiles=100, per_station=False,
+                     station_ids_pred=None, station_ids_train=None):
+    """Quantile mapping bias correction.
+    
+    Aligns the prediction distribution to the observed distribution.
+    Critical for MBE reduction: corrects systematic over/under-prediction
+    by mapping predicted quantiles to observed quantiles.
+    
+    References:
+    - NotebookLM RMSE Research: "Quantile mapping corrects distribution shape 
+      and extremes. Highly effective in regions with high cloud variability."
+    - Perplexity consensus: "2-3 W/m2 RMSE reduction + MBE -> near 0"
+    
+    Parameters
+    ----------
+    preds : np.ndarray (N,)
+        Predictions to correct (test set).
+    true_train : np.ndarray (M,)
+        True GHI from training/validation.
+    preds_train : np.ndarray (M,)
+        Model predictions on training/validation (OOF).
+    n_quantiles : int
+        Number of quantiles for mapping (default: 100).
+    per_station : bool
+        If True, apply per-station quantile mapping (requires station IDs).
+    station_ids_pred : np.ndarray (N,) or None
+        Station IDs for test predictions.
+    station_ids_train : np.ndarray (M,) or None
+        Station IDs for training data.
+    
+    Returns
+    -------
+    corrected : np.ndarray (N,)
+    """
+    from scipy.interpolate import interp1d
+    
+    corrected = preds.copy().astype(np.float64)
+    
+    if per_station and station_ids_pred is not None and station_ids_train is not None:
+        # Per-station quantile mapping
+        unique_stations = np.unique(station_ids_pred)
+        for station in unique_stations:
+            train_mask = station_ids_train == station
+            pred_mask = station_ids_pred == station
+            
+            if train_mask.sum() < 50:
+                continue  # Not enough data for this station
+            
+            # Compute quantile mapping for this station
+            quantile_levels = np.linspace(0, 1, n_quantiles)
+            true_q = np.nanquantile(true_train[train_mask], quantile_levels)
+            pred_q = np.nanquantile(preds_train[train_mask], quantile_levels)
+            
+            # Ensure monotonic for interpolation
+            if np.all(np.diff(pred_q) >= 0) or len(np.unique(pred_q)) > 5:
+                try:
+                    f = interp1d(pred_q, true_q, kind='linear', 
+                                fill_value='extrapolate', bounds_error=False)
+                    corrected[pred_mask] = f(preds[pred_mask])
+                except ValueError:
+                    pass  # Fallback: leave uncorrected
+    else:
+        # Global quantile mapping
+        valid_train = ~np.isnan(true_train) & ~np.isnan(preds_train)
+        if valid_train.sum() > 50:
+            quantile_levels = np.linspace(0, 1, n_quantiles)
+            true_q = np.nanquantile(true_train[valid_train], quantile_levels)
+            pred_q = np.nanquantile(preds_train[valid_train], quantile_levels)
+            
+            try:
+                f = interp1d(pred_q, true_q, kind='linear',
+                            fill_value='extrapolate', bounds_error=False)
+                corrected = f(preds)
+            except ValueError:
+                pass
+    
+    # Physical constraint: GHI >= 0
+    corrected = np.maximum(corrected, 0.0).astype(np.float32)
+    
+    print(f"[QM] Quantile mapping applied: mean shift = {np.mean(corrected - preds):.3f} W/m2")
+    
+    return corrected
+
+
 def postprocess_predictions(df_preds, station_col='station',
                             time_col='timestamp',
                             kt_col='kt_pred',

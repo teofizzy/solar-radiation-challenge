@@ -1,6 +1,10 @@
 """
 Inference and submission generation.
 Loads trained model, runs prediction on test data, and outputs Zindi submission CSV.
+
+Updated for Stage 1 architecture:
+- Model forward signature uses cos_zenith instead of is_night
+- Single delta_kt head (no raw_correction)
 """
 
 import os
@@ -23,7 +27,7 @@ def predict(dataset, models=None, model_paths: list = None,
     ----------
     dataset : SolarDataset
         Dataset to predict on.
-    models : list of PhysicsInformedBiLSTM or None
+    models : list of PhysicsInformedPatchTransformer or None
         Trained models for ensembling.
     model_paths : list of str or None
         Paths to model checkpoints.
@@ -88,7 +92,7 @@ def predict(dataset, models=None, model_paths: list = None,
             station_idx = batch['station_idx'].to(device)
             diag_vector = batch['diag_vector'].to(device)
             clear_sky = batch['clear_sky_ghi'].to(device)
-            is_night = batch['is_night'].to(device)
+            cos_zenith = batch['cos_zenith'].to(device)
             center_kt_landsaf = batch['center_kt_landsaf'].to(device)
             atmos_feats = batch['atmos_feats'].to(device)
             is_test = batch['is_test'].numpy()
@@ -97,7 +101,13 @@ def predict(dataset, models=None, model_paths: list = None,
             ensemble_ghi = []
             
             for m in models:
-                _, ghi_pred = m(x, station_idx, diag_vector, clear_sky, is_night, center_kt_landsaf, atmos_feats)
+                # Force FP32 for inference stability
+                with torch.amp.autocast('cuda', enabled=False):
+                    _, ghi_pred = m(
+                        x.float(), station_idx, diag_vector.float(),
+                        clear_sky.float(), cos_zenith.float(),
+                        center_kt_landsaf.float(), atmos_feats.float()
+                    )
                 ensemble_ghi.append(ghi_pred.cpu().numpy())
                 
             # Average across the ensemble

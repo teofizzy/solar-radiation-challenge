@@ -1,20 +1,15 @@
 """
-Custom loss function aligned with Zindi evaluation metrics.
+Stage 1 Loss: Clear-Sky Weighted MSE on delta_kt.
 
-Zindi scoring:
-    Final = 0.5 * |MBE| + 0.5 * RMSE
-    where:
-        MBE = mean(predicted - observed)
-        RMSE = sqrt(mean((predicted - observed)^2))
+Design rationale (from multi-AI consensus + Gemini correction):
+    - MSE on delta_kt keeps optimization in bounded kt-space, preventing 
+      the gradient explosion that occurs with unbounded GHI-space targets.
+    - Clear-sky weighting addresses Gemini's valid critique: a 0.1 kt error 
+      at dawn (GHI_cs=50, 5 W/m2) should cost less than at noon (GHI_cs=1000, 100 W/m2).
+    - Daytime-only masking eliminates nighttime noise from the loss landscape.
+    - No multi-task components. No signed MBE penalty. Single objective.
 
-Architecture:
-    Multi-task loss with two components:
-    1. Auxiliary: LogCosh(delta_kt) for stable gradient flow during early training.
-    2. Primary: Direct Zindi composite (0.5*RMSE + 0.5*|MBE|) on reconstructed GHI.
-
-    Total = dkt_weight * LogCosh(delta_kt) + zindi_weight * ZindiComposite(GHI)
-
-    Default weights: dkt_weight=0.4, zindi_weight=0.6 (per multi-AI consensus).
+Zindi evaluation function preserved for validation/submission scoring.
 """
 
 import torch
@@ -22,82 +17,89 @@ import torch.nn as nn
 import numpy as np
 
 
-class ZindiSolarLoss(nn.Module):
-    """
-    Multi-task loss directly targeting the Zindi leaderboard metric.
+class Stage1Loss(nn.Module):
+    """Clear-sky weighted MSE on delta_kt.
     
-    Components:
-        1. LogCosh(delta_kt) -- auxiliary, stabilizes early learning.
-        2. ZindiComposite(GHI) = 0.5 * RMSE(GHI) + 0.5 * |MBE(GHI)| -- primary.
+    The weight is proportional to clear_sky_ghi, so errors at solar noon
+    (high GHI_cs) are penalized proportionally more than errors at dawn/dusk.
+    This aligns the kt-space optimization with the Zindi GHI-space metric.
     
     Parameters
     ----------
-    dkt_weight : float
-        Weight for the auxiliary delta_kt LogCosh loss.
-    zindi_weight : float
-        Weight for the direct Zindi composite on reconstructed GHI.
+    None. This is a single-objective loss with no tunable weights.
     """
-    def __init__(self, dkt_weight: float = 0.4, zindi_weight: float = 0.6):
+    def __init__(self):
         super().__init__()
-        self.dkt_weight = dkt_weight
-        self.zindi_weight = zindi_weight
 
     def forward(self, delta_kt_pred, ghi_pred,
                 target_delta_kt, target_ghi,
-                is_night, clear_sky_ghi):
+                cos_zenith, clear_sky_ghi):
         """
-        Compute multi-task loss.
+        Compute clear-sky weighted MSE on delta_kt.
         
-        All inputs are (B,) tensors. Daytime-only masking is applied internally.
+        All inputs are (B,) tensors. Daytime masking uses cos_zenith > 0 
+        (replaces is_night binary flag).
+        
+        Parameters
+        ----------
+        delta_kt_pred : (B,) predicted clearness index correction
+        ghi_pred : (B,) reconstructed GHI (for metric logging only)
+        target_delta_kt : (B,) true clearness index correction
+        target_ghi : (B,) true GHI (for metric logging only)
+        cos_zenith : (B,) cosine of solar zenith angle
+        clear_sky_ghi : (B,) clear-sky GHI at center timestep
+        
+        Returns
+        -------
+        loss : scalar tensor
+        metrics : dict of scalar metric values for logging
         """
-        # 1. Daytime Mask (exclude night and NaN targets)
-        day_mask = (is_night < 0.5) & (~torch.isnan(target_ghi))
+        # 1. Daytime Mask: cos_zenith > 0 means sun above horizon (SZA < 90)
+        # Also exclude NaN targets (test samples that leaked into training)
+        day_mask = (cos_zenith > 0) & (~torch.isnan(target_delta_kt))
+        
         if day_mask.sum() == 0:
             zero = torch.tensor(0.0, device=ghi_pred.device, requires_grad=True)
-            return zero, {'loss': 0.0, 'dkt_logcosh': 0.0, 'ghi_rmse': 0.0, 
-                         'mbe': 0.0, 'zindi': 0.0}
+            return zero, {'loss': 0.0, 'dkt_wmse': 0.0, 'dkt_mbe': 0.0,
+                         'ghi_rmse': 0.0, 'mbe': 0.0, 'zindi': 0.0}
 
-        # 2. Auxiliary: Delta kt LogCosh (numerically stable version)
-        # log(cosh(x)) = |x| + log(1 + exp(-2*|x|)) - log(2)
-        # This prevents INF overflow when dkt_err is large (e.g. > 88 in float32 or > 11 in float16)
+        # 2. Delta kt error (bounded space)
         dkt_err = delta_kt_pred[day_mask] - target_delta_kt[day_mask]
-        abs_err = torch.abs(dkt_err)
-        loss_dkt = torch.mean(abs_err + torch.nn.functional.softplus(-2.0 * abs_err) - np.log(2.0))
         
-        # 3. Primary: Zindi Composite on reconstructed GHI
-        ghi_err = ghi_pred[day_mask] - target_ghi[day_mask]
+        # 3. Clear-sky weighting (Gemini correction)
+        # Normalize so that mean weight = 1.0 (loss magnitude is stable across batches)
+        cs_ghi_day = clear_sky_ghi[day_mask]
+        weights = cs_ghi_day / (cs_ghi_day.mean() + 1e-6)
+        # Clamp weights to prevent extreme outliers from dominating
+        weights = torch.clamp(weights, min=0.1, max=5.0)
         
-        # RMSE (in W/m2, same units as leaderboard)
-        rmse = torch.sqrt(torch.mean(ghi_err ** 2) + 1e-8)
+        # 4. Weighted MSE on delta_kt
+        wmse = (weights * dkt_err ** 2).mean()
         
-        # |MBE| (absolute mean bias)
-        mbe = torch.mean(ghi_err)
-        abs_mbe = torch.abs(mbe)
-        
-        # Zindi composite: 0.5 * RMSE + 0.5 * |MBE|
-        zindi_composite = 0.5 * rmse + 0.5 * abs_mbe
-        
-        # 4. MBE Amplifier
-        # Penalize the sign of mean bias to force the model to correct drift
-        # sign_loss captures the direction of systematic error
-        sign_loss = mbe  # differentiable, not abs — pushes toward zero mean
-        
-        # 5. Total weighted loss
-        total_loss = (self.dkt_weight * loss_dkt 
-                      + self.zindi_weight * zindi_composite 
-                      + 0.1 * sign_loss)
+        # 5. Compute GHI-space metrics for logging (NOT used in loss gradient)
+        with torch.no_grad():
+            ghi_err = ghi_pred[day_mask] - target_ghi[day_mask]
+            valid_ghi = ~torch.isnan(ghi_err)
+            if valid_ghi.sum() > 0:
+                ghi_err_valid = ghi_err[valid_ghi]
+                ghi_rmse = torch.sqrt(torch.mean(ghi_err_valid ** 2) + 1e-8).item()
+                ghi_mbe = torch.mean(ghi_err_valid).item()
+                ghi_abs_mbe = abs(ghi_mbe)
+                zindi_score = 0.5 * ghi_abs_mbe + 0.5 * ghi_rmse
+            else:
+                ghi_rmse = ghi_mbe = ghi_abs_mbe = zindi_score = 0.0
         
         metrics = {
-            'loss': total_loss.item(),
-            'dkt_logcosh': loss_dkt.item(),
-            'ghi_rmse': rmse.item(),
-            'mbe': mbe.item(),
-            'abs_mbe': abs_mbe.item(),
-            'zindi': (0.5 * abs_mbe.item() + 0.5 * rmse.item()),
-            'zindi_composite_raw': zindi_composite.item(),
+            'loss': wmse.item(),
+            'dkt_wmse': wmse.item(),
+            'dkt_mbe': dkt_err.mean().item(),
+            'ghi_rmse': ghi_rmse,
+            'mbe': ghi_mbe,
+            'abs_mbe': ghi_abs_mbe,
+            'zindi': zindi_score,
         }
         
-        return total_loss, metrics
+        return wmse, metrics
 
 
 def compute_zindi_score(ghi_pred, ghi_target):
