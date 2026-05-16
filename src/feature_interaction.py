@@ -4,41 +4,30 @@ from .config import DTYPE
 
 def compute_interaction_features(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Computes multiplicative physics interactions based on AI ensemble consensus.
-    These features provide explicit inductive biases for atmospheric attenuation.
+    Computes MINIMAL physics interactions based on Multi-AI consensus.
+    
+    Pruned features (ChatGPT, Compare AIs consensus):
+      - zenith_humidity: Transformer learns cos_zenith * humidity internally
+      - zenith_cloud: Same redundancy issue
+      - airmass_water: Redundant with airmass_aerosol (similar Beer-Lambert physics)
+      - cloud_advection_potential: Complex derived; Transformer learns wind*kt_gradient
+    
+    Kept features:
+      - airmass_aerosol: Strong Beer-Lambert physics (scattering scales with path length)
+      - clearness_regime_shift: Fast-slow EWMA differential (cloud onset/clearing detector)
     """
-    print("[INTERACTION] Computing multiplicative physics interactions...")
+    print("[INTERACTION] Computing minimal physics interactions...")
     
     new_cols = {}
     
-    # 1. Zenith-Coupled Attenuation (Path-length scaling)
-    if 'cos_zenith' in df.columns:
-        # Humidity absorption scales with path length
-        if 'relativehumidity' in df.columns:
-            new_cols['zenith_humidity'] = (df['cos_zenith'] * df['relativehumidity']).astype(DTYPE)
-        
-        # Cloud attenuation scales with potential radiation
-        if 'kt_landsaf' in df.columns:
-            new_cols['zenith_cloud'] = (df['cos_zenith'] * df['kt_landsaf']).astype(DTYPE)
-            
-    # 2. Air Mass / Path-Length Scaling
-    if 'air_mass' in df.columns:
-        # Aerosol scattering increases with air mass
-        if 'tropomi_aerosol' in df.columns:
-            new_cols['airmass_aerosol'] = (df['air_mass'] * df['tropomi_aerosol']).astype(DTYPE)
-            
-        # Total column water vapor absorption scales with air mass
-        if 'tcwv' in df.columns:
-            new_cols['airmass_water'] = (df['air_mass'] * df['tcwv']).astype(DTYPE)
+    # 1. Air Mass x Aerosol (Beer-Lambert Law: scattering scales with optical path)
+    # This is the ONLY interaction that all AI sources agree should be kept.
+    if 'air_mass' in df.columns and 'tropomi_aerosol' in df.columns:
+        new_cols['airmass_aerosol'] = (df['air_mass'] * df['tropomi_aerosol']).astype(DTYPE)
 
-    # 3. Regime Detection (Differential memory)
+    # 2. Regime Detection (Differential memory: fast vs slow EWMA)
     if 'ewma_kt_fast' in df.columns and 'ewma_kt_slow' in df.columns:
         new_cols['clearness_regime_shift'] = (df['ewma_kt_fast'] - df['ewma_kt_slow']).astype(DTYPE)
-
-    # 4. Cloud Advection Potential (Dynamic wind-cloud interaction)
-    if 'wind_speed' in df.columns and 'kt_landsaf' in df.columns:
-        kt_grad = df.groupby('station')['kt_landsaf'].diff(4).fillna(0)
-        new_cols['cloud_advection_potential'] = (df['wind_speed'] * kt_grad.abs()).astype(DTYPE)
 
     # Assign new columns
     for col, values in new_cols.items():

@@ -29,8 +29,8 @@ ASTRO_FEATURES = ['cos_zenith', 'csghi_terrain_corr']
 # ERA5: Use terrain-corrected versions (lapse rate, hypsometry) + missing flag
 ERA5_FEATURES = ['u10', 'v10', 't_lapse_corr', 'p_hyps_corr', 'tco3', 'tcwv', 'era5_missing']
 
+# Wind direction sin/cos REMOVED: redundant with u10/v10 (ChatGPT, Compare AIs consensus)
 PHYSICS_FEATURES = [
-    'wind_direction_sin', 'wind_direction_cos',
     'dewpoint_depression', 'pw_attenuation', 'turbidity_proxy',
     'hour_sin', 'hour_cos', 'hour_12_sin', 'hour_12_cos', 
     'hour_6_sin', 'hour_6_cos',
@@ -79,8 +79,9 @@ def get_feature_columns(df: pd.DataFrame) -> list:
                  c in ('drift_proxy', 'log_cum_exposure', 'clearness_regime_shift')]
     candidates += sorted(ewma_cols)
 
-    # Add Interaction features
-    inter_cols = ['zenith_humidity', 'zenith_cloud', 'airmass_aerosol', 'airmass_water']
+    # Add Interaction features (pruned: only airmass_aerosol kept per ChatGPT consensus)
+    # Removed: zenith_humidity, zenith_cloud, airmass_water (Transformer learns these internally)
+    inter_cols = ['airmass_aerosol']
     candidates += [c for c in inter_cols if c in df.columns]
 
     # Filter to only available columns
@@ -253,29 +254,108 @@ class SolarDataset(Dataset):
               f"{len(feature_cols)} features, "
               f"window={self.seq_len}")
 
+    # Feature categories for hybrid normalization
+    # Multi-AI consensus: PISSM paper, ChatGPT, Deep Search, ERA5_Ag paper
+    _NO_SCALE_PREFIXES = {
+        # Physics-bounded [-1,1] or [0,1.05]: already in optimal range
+        'cos_zenith', 'kt_landsaf',
+        # Temporal cycles: deterministic, already [-1,1]
+        'hour_sin', 'hour_cos', 'hour_12_sin', 'hour_12_cos',
+        'hour_6_sin', 'hour_6_cos', 'doy_sin', 'doy_cos',
+        # Binary flags: 0/1
+        'era5_missing', 'tropomi_cloud_missing', 'tropomi_aerosol_missing',
+        'is_night',
+        # Static per-station: constant within a station's window
+        'lu_',
+    }
+    _MINMAX_FEATURES = {
+        # Bounded positive: clear-sky GHI [0, ~1200], days_since_start [0, N]
+        'csghi_terrain_corr', 'days_since_start',
+        # Satellite irradiance products (bounded positive)
+        'mdssf', 'mlst',
+        # Static distance (bounded positive)
+        'dist_water',
+    }
+    _ROBUST_FEATURES = {
+        # Heavy-tailed: exact column names only (no prefix matching)
+        'log_precipitation', 'tropomi_aerosol',
+    }
+    # Everything else: Z-score (ERA5, local weather, rolling stats, lags, age_hours, EWMA, etc.)
+
+    def _get_feature_category(self, col: str) -> str:
+        """Classify a feature column into its normalization category."""
+        # Priority 1: No-scale (exact match or prefix match for lu_)
+        for prefix in self._NO_SCALE_PREFIXES:
+            if col == prefix or col.startswith(prefix):
+                return 'none'
+        # Priority 2: Min-Max (exact match or startswith for csghi_terrain_corr variants)
+        if col in self._MINMAX_FEATURES or any(col.startswith(p) for p in self._MINMAX_FEATURES):
+            return 'minmax'
+        # Priority 3: Robust (exact match ONLY -- prevents tropomi_aerosol matching tropomi_aerosol_age_hours)
+        if col in self._ROBUST_FEATURES:
+            return 'robust'
+        # Default: Z-score
+        return 'zscore'
+
     def _compute_scaler(self, df: pd.DataFrame, feature_cols: list):
         """
-        Compute robust normalization stats (Median/IQR) from TRAINING data only.
-        Weather data is heavy-tailed; mean/std is too sensitive to outliers.
+        Physics-aware hybrid normalization (Multi-AI consensus).
+        
+        Different feature families get different treatment:
+          - No scaling: physics-bounded, temporal cycles, binary flags
+          - Min-Max: clear-sky GHI, satellite products, static distances
+          - Robust (Median/IQR): heavy-tailed aerosol/precipitation
+          - Z-score (mean/std): ERA5, local weather, rolling stats, lags
+          
+        All statistics computed on TRAINING months only (odd months).
+        Global normalization preferred over per-station (ERA5_Ag paper: identical results).
         """
         if self.is_train:
-            # Use only odd months (training months) for scaler
             train_mask = df['month'].isin([1, 3, 5, 7, 9, 11])
             train_data = df.loc[train_mask, feature_cols]
         else:
             train_data = df[feature_cols]
 
-        # Robust Scaling: center on median, scale by IQR
-        self.mean = train_data.median().to_numpy().astype(np.float32)
-        q25 = train_data.quantile(0.25).to_numpy().astype(np.float32)
-        q75 = train_data.quantile(0.75).to_numpy().astype(np.float32)
-        self.std = (q75 - q25).astype(np.float32)
-        
-        # Prevent division by zero; use 1.0 for constant or binary features
-        # Weather data can have zero variance in small windows/batches
-        self.std = np.where(self.std < 1e-6, 1.0, self.std)
+        n_feats = len(feature_cols)
+        self.mean = np.zeros(n_feats, dtype=np.float32)
+        self.std = np.ones(n_feats, dtype=np.float32)
 
-        print(f"  [SCALER] Global Robust Scaling (Median/IQR) active for {len(feature_cols)} features.")
+        counts = {'none': 0, 'zscore': 0, 'minmax': 0, 'robust': 0}
+
+        for i, col in enumerate(feature_cols):
+            cat = self._get_feature_category(col)
+            counts[cat] += 1
+            col_data = train_data[col].dropna()
+
+            if cat == 'none':
+                # No scaling: mean=0, std=1 (identity transform)
+                self.mean[i] = 0.0
+                self.std[i] = 1.0
+
+            elif cat == 'minmax':
+                # Min-Max: center=min, scale=max-min -> maps to [0, 1]
+                c_min = col_data.min()
+                c_max = col_data.max()
+                self.mean[i] = np.float32(c_min)
+                self.std[i] = np.float32(max(c_max - c_min, 1e-6))
+
+            elif cat == 'robust':
+                # Robust: center=median, scale=IQR
+                self.mean[i] = np.float32(col_data.median())
+                q25 = np.float32(col_data.quantile(0.25))
+                q75 = np.float32(col_data.quantile(0.75))
+                iqr = q75 - q25
+                self.std[i] = np.float32(max(iqr, 1e-6))
+
+            else:  # zscore
+                # Z-score: center=mean, scale=std
+                self.mean[i] = np.float32(col_data.mean())
+                col_std = np.float32(col_data.std())
+                self.std[i] = np.float32(max(col_std, 1e-6))
+
+        print(f"  [SCALER] Hybrid normalization for {n_feats} features:")
+        print(f"    No-scale: {counts['none']}, Z-score: {counts['zscore']}, "
+              f"Min-Max: {counts['minmax']}, Robust: {counts['robust']}")
 
     def get_scaler_stats(self) -> dict:
         """Return scaler statistics for reuse in test dataset."""
@@ -302,10 +382,11 @@ class SolarDataset(Dataset):
         is_night_seq = sample['is_night_full'][center - hw:center + hw] # (seq_len,)
         is_night_tensor = torch.from_numpy(is_night_seq).float()
         
-        # 8. Augmentations (Training Only)
+        # 8. Augmentations (Training Only) -- Physics-aware
         if self.is_train:
             from src.augment import apply_intensity_jitter, apply_temporal_mask
-            x_tensor = apply_intensity_jitter(x_tensor, is_night_tensor, p=0.4)
+            x_tensor = apply_intensity_jitter(x_tensor, is_night_tensor, p=0.4,
+                                               feature_cols=self.feature_cols)
             x_tensor = apply_temporal_mask(x_tensor, p=0.2)
 
         return {

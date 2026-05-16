@@ -94,21 +94,26 @@ class CurriculumScheduler:
 # Loss Annealing: MSE -> Huber at 60% of training
 # ------------------------------------------------------------------
 class AnnealingLoss(nn.Module):
-    """Clear-sky weighted MSE that transitions to Huber at 60% of epochs.
+    """Clear-sky weighted MSE that transitions to Huber at 60% of epochs,
+    with a GHI-space MBE anchor to prevent systematic bias accumulation.
     
     Why:
     - MSE squares large errors -> outliers (cloud spikes) dominate early
     - Huber (delta=0.03 in kt-space) caps outlier gradients later
-    - Transition preserves early learning signal while taming late-stage noise
+    - MBE anchor prevents the loss-metric misalignment that causes
+      train loss decrease but val MBE/RMSE increase
     
     References:
-    - ChatGPT: "Huber stabilizes cloud spikes; 3-5 W/m2 RMSE reduction"
-    - Perplexity: "delta=20 W/m2 matches MBE gap" (adjusted to kt-space: ~0.03)
+    - Perplexity: "Removing MBE penalty was a mistake. alpha=0.10-0.20"
+    - ChatGPT: "Apply MBE in GHI space. lambda=0.005-0.02, start at 0.01"
+    - Gemini: "FiLM learns to over-correct without bias constraint"
+    - NotebookLM: "Successful papers use standard MSE + residual stacking for bias"
     """
-    def __init__(self, huber_delta_kt=0.03, switch_frac=0.60):
+    def __init__(self, huber_delta_kt=0.03, switch_frac=0.60, lambda_mbe=0.01):
         super().__init__()
         self.huber_delta = huber_delta_kt
         self.switch_frac = switch_frac
+        self.lambda_mbe = lambda_mbe
         self.huber = nn.HuberLoss(delta=huber_delta_kt, reduction='none')
     
     def forward(self, delta_kt_pred, ghi_pred,
@@ -117,7 +122,7 @@ class AnnealingLoss(nn.Module):
                 epoch, total_epochs,
                 curriculum_weights=None):
         """
-        Compute the annealing loss with optional curriculum weighting.
+        Compute the annealing loss with MBE anchor and optional curriculum weighting.
         
         Returns: loss, metrics_dict
         """
@@ -127,15 +132,17 @@ class AnnealingLoss(nn.Module):
         if day_mask.sum() == 0:
             zero = torch.tensor(0.0, device=ghi_pred.device, requires_grad=True)
             return zero, {'loss': 0.0, 'dkt_mse': 0.0, 'ghi_rmse': 0.0, 
-                         'mbe': 0.0, 'abs_mbe': 0.0, 'zindi': 0.0}
+                         'mbe': 0.0, 'abs_mbe': 0.0, 'zindi': 0.0,
+                         'mbe_loss': 0.0}
         
         # Delta kt error
         dkt_err = delta_kt_pred[day_mask] - target_delta_kt[day_mask]
         
-        # Clear-sky weighting
+        # Clear-sky QUADRATIC weighting (matches GHI-space MSE geometry)
+        # Linear cs/mean under-weights noon by ~200x vs evaluation; cs²/mean(cs²) is exact.
         cs_ghi_day = clear_sky_ghi[day_mask]
-        cs_weights = cs_ghi_day / (cs_ghi_day.mean() + 1e-6)
-        cs_weights = torch.clamp(cs_weights, min=0.1, max=5.0)
+        cs_sq = cs_ghi_day ** 2
+        cs_weights = cs_sq / (cs_sq.mean() + 1e-6)
         
         # Loss function selection based on epoch
         frac = epoch / max(total_epochs, 1)
@@ -155,18 +162,30 @@ class AnnealingLoss(nn.Module):
             cur_w = curriculum_weights[day_mask]
             per_sample_loss = per_sample_loss * cur_w
             # Normalize by sum of weights to keep loss magnitude stable
-            loss = per_sample_loss.sum() / (cur_w.sum() + 1e-6)
+            primary_loss = per_sample_loss.sum() / (cur_w.sum() + 1e-6)
         else:
-            loss = per_sample_loss.mean()
+            primary_loss = per_sample_loss.mean()
+        
+        # GHI-space MBE anchor (prevents systematic bias drift)
+        ghi_err = ghi_pred[day_mask] - target_ghi[day_mask]
+        valid_ghi = ~torch.isnan(ghi_err)
+        
+        if valid_ghi.sum() > 0:
+            ghi_err_valid = ghi_err[valid_ghi]
+            mbe_ghi = ghi_err_valid.mean()
+            mbe_loss = torch.abs(mbe_ghi)
+        else:
+            mbe_loss = torch.tensor(0.0, device=ghi_pred.device)
+            mbe_ghi = torch.tensor(0.0)
+        
+        # Combined loss: primary (kt MSE/Huber) + MBE anchor (GHI space)
+        loss = primary_loss + self.lambda_mbe * mbe_loss
         
         # GHI metrics for logging
         with torch.no_grad():
-            ghi_err = ghi_pred[day_mask] - target_ghi[day_mask]
-            valid_ghi = ~torch.isnan(ghi_err)
             if valid_ghi.sum() > 0:
-                ghi_err_valid = ghi_err[valid_ghi]
                 ghi_rmse = torch.sqrt(torch.mean(ghi_err_valid ** 2) + 1e-8).item()
-                ghi_mbe = torch.mean(ghi_err_valid).item()
+                ghi_mbe = mbe_ghi.item()
                 ghi_abs_mbe = abs(ghi_mbe)
                 zindi_score = 0.5 * ghi_abs_mbe + 0.5 * ghi_rmse
             else:
@@ -179,6 +198,7 @@ class AnnealingLoss(nn.Module):
             'mbe': ghi_mbe,
             'abs_mbe': ghi_abs_mbe,
             'zindi': zindi_score,
+            'mbe_loss': (self.lambda_mbe * mbe_loss).item(),
             'loss_type': 'huber' if frac >= self.switch_frac else 'mse',
         }
         
@@ -324,6 +344,7 @@ def train_model(dataset, feature_cols: list, val_months: list = None,
     criterion = AnnealingLoss(
         huber_delta_kt=HPARAMS.get('huber_delta_kt', 0.03),
         switch_frac=HPARAMS.get('huber_switch_frac', 0.60),
+        lambda_mbe=HPARAMS.get('lambda_mbe', 0.01),
     )
 
     # Mixed precision

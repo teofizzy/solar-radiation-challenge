@@ -356,9 +356,10 @@ def get_default_sweep_config():
             # Phase 2: Curriculum Learning
             'use_curriculum':    {'values': [True, False]},
             
-            # Phase 3: Loss Annealing (MSE -> Huber)
+            # Phase 3: Loss Annealing (MSE -> Huber) + MBE anchor
             'huber_delta_kt':    {'distribution': 'uniform', 'min': 0.01, 'max': 0.08},
             'huber_switch_frac': {'distribution': 'uniform', 'min': 0.40, 'max': 0.80},
+            'lambda_mbe':        {'distribution': 'log_uniform_values', 'min': 0.005, 'max': 0.05},
             
             # Phase 4: SWA
             'use_swa':           {'values': [True, False]},

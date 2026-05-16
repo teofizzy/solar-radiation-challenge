@@ -157,6 +157,7 @@ def train_model_ddp(dataset, feature_cols: list, val_months: list = None,
     criterion = AnnealingLoss(
         huber_delta_kt=HPARAMS.get('huber_delta_kt', 0.03),
         switch_frac=HPARAMS.get('huber_switch_frac', 0.60),
+        lambda_mbe=HPARAMS.get('lambda_mbe', 0.01),
     )
     curriculum = CurriculumScheduler(total_epochs)
     use_curriculum = HPARAMS.get('use_curriculum', True)

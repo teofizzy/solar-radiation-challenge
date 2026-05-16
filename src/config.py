@@ -130,10 +130,11 @@ HPARAMS = {
     'curriculum_warmup_frac': 0.30,   # Epochs 0-30%: clear-sky emphasis
     'curriculum_medium_frac': 0.60,   # Epochs 30-60%: broken clouds
     
-    # Phase 3: Loss Annealing (MSE -> Huber at switch_frac)
-    # Reference: ChatGPT consensus: 3-5 W/m2 RMSE reduction
+    # Phase 3: Loss Annealing (MSE -> Huber at switch_frac) + MBE anchor
+    # Reference: ChatGPT: "Apply MBE in GHI space. lambda=0.005-0.02, start at 0.01"
     'huber_delta_kt': 0.03,           # delta in kt-space (~20 W/m2 at noon)
     'huber_switch_frac': 0.60,        # Switch from MSE to Huber at 60% epochs
+    'lambda_mbe': 0.01,               # GHI-space MBE anchor weight (prevents bias drift)
     
     # Phase 4: Stochastic Weight Averaging (SWA)
     # Reference: ChatGPT consensus: 2-5 W/m2 RMSE reduction
