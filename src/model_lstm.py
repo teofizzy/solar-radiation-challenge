@@ -136,10 +136,8 @@ class PhysicsInformedBiLSTM(nn.Module):
         # 7. Reconstruct GHI = MDSSF + residual
         ghi_pred = mdssf_ghi + residual_pred
 
-        # 8. Physical clamping: GHI in [0, 1.3 * clear_sky_ghi]
-        # 1.3 accounts for cloud enhancement / lensing effects
-        ghi_upper = 1.3 * clear_sky_ghi
-        ghi_pred = torch.clamp(ghi_pred, 0.0, ghi_upper)
+        # 8. Physical lower bound: GHI >= 0 (non-negative radiation)
+        ghi_pred = torch.clamp(ghi_pred, min=0.0)
 
         # 9. Hard night gate: force GHI = 0 at night
         day_mask = (1.0 - is_night).float()

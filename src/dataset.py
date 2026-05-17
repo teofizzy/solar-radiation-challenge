@@ -43,7 +43,7 @@ ERA5_FEATURES = ['u10', 'v10', 't_lapse_corr', 'p_hyps_corr', 'tco3', 'tcwv', 'e
 PHYSICS_FEATURES = [
     'dewpoint_depression', 'pw_attenuation', 'turbidity_proxy',
     'hour_sin', 'hour_cos',
-    'doy_sin', 'doy_cos', 'days_since_start'
+    'days_since_start'
 ]
 
 LOCAL_FEATURES = ['temperature', 'relativehumidity', 'log_precipitation']
@@ -97,10 +97,6 @@ def get_lgbm_feature_columns(df: pd.DataFrame) -> list:
                        'tropomi_aerosol_missing', 'tropomi_aerosol_age_hours']
     candidates += [c for c in extra_satellite if c in df.columns]
 
-    # Extra temporal harmonics
-    extra_harmonics = ['hour_12_sin', 'hour_12_cos', 'hour_6_sin', 'hour_6_cos']
-    candidates += [c for c in extra_harmonics if c in df.columns]
-
     # Rolling/lag/diff/std features (valuable for trees)
     rolling_cols = sorted([c for c in df.columns if '_roll_' in c or '_diff_' in c or
                            c in ('volatility_index', 'sticky_dust_index', 'advection_kt')])
@@ -147,8 +143,7 @@ class SolarDataset(Dataset):
     # ---- Feature categories for hybrid normalization ----
     _NO_SCALE_PREFIXES = {
         'cos_zenith', 'kt_landsaf',
-        'hour_sin', 'hour_cos', 'hour_12_sin', 'hour_12_cos',
-        'hour_6_sin', 'hour_6_cos', 'doy_sin', 'doy_cos',
+        'hour_sin', 'hour_cos',
         'era5_missing', 'tropomi_cloud_missing', 'tropomi_aerosol_missing',
         'is_night',
         'lu_',
