@@ -101,24 +101,27 @@ HPARAMS = {
     # Sequence / windowing (V1 baseline: 12h symmetric)
     'seq_len': 48,            # 12 hours @ 15-min cadence
     'half_window': 24,        # One side of the symmetric window
-    
-    # BiLSTM Architecture (V1 reverted + per-station bias)
-    'hidden_dim': 160,        # Slightly larger than V1 (128) for capacity
-    'n_layers': 2,            # 2-layer BiLSTM (V1 baseline)
+
+    # BiLSTM Architecture (residual prediction)
+    'hidden_dim': 160,        # BiLSTM hidden dim
+    'n_layers': 2,            # 2-layer BiLSTM (locked -- 3L causes gradient explosion)
     'dropout': 0.15,          # Regularization
     'station_embed_dim': 16,  # Station embedding dimension
-    
-    # Training (FP32 -- no AMP to avoid autocast precision issues)
-    'batch_size': 64,         # V1 baseline
-    'lr': 1e-3,               # Standard Adam LR for BiLSTM
+
+    # Training (FP32 -- no AMP to avoid autocast swings)
+    'batch_size': 64,
+    'lr': 1e-3,               # AdamW LR
     'weight_decay': 1e-4,
     'patience': 15,           # Early stopping patience
     'epochs': 80,             # Sufficient for BiLSTM convergence
     'grad_clip': 1.0,
-    'use_amp': False,         # FP32 training (no autocast swings)
+    'use_amp': False,         # FP32 training
+
+    # Loss: SolarHuberLoss (NOT Zindi loss -- prevents oscillation)
+    'huber_delta': 50.0,      # Sweepable: [30, 50, 70, 100] W/m2
+    'lambda_smooth': 0.0,     # Smoothness penalty (if needed later)
 
     # Physics & Constraints
-    'kt_max': 1.05,           # Physical kt upper bound
     'night_zenith_threshold': 90.0,
     'clearsky_min_denom': 1.0,
 }

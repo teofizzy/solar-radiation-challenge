@@ -1,11 +1,11 @@
 """
-Inference and submission generation.
-Loads trained BiLSTM model, runs prediction on test data, and outputs Zindi submission CSV.
+Inference and submission generation for the Hybrid BiLSTM pipeline.
 
-Updated for V1 reverted architecture:
-- Model forward: (x, station_idx, clear_sky_ghi, is_night) -> (kt_pred, ghi_pred)
-- No diag_vector, no atmos_feats, no center_kt_landsaf
-- FP32 inference
+Architecture (Hybrid V2):
+  - Model predicts: residual = GHI - MDSSF (raw residual)
+  - GHI = MDSSF + residual, clamped to [0, 1.3*clear_sky]
+  - Missing predictions: use MDSSF satellite value (NOT 0)
+  - FP32 inference (no AMP)
 """
 
 import os
@@ -24,23 +24,12 @@ def predict(dataset, models=None, model_paths: list = None,
     """
     Run inference on the dataset and return predictions.
 
-    Parameters
-    ----------
-    dataset : SolarDataset
-        Dataset to predict on.
-    models : list of PhysicsInformedBiLSTM or None
-        Trained models for ensembling.
-    model_paths : list of str or None
-        Paths to model checkpoints.
-    feature_cols : list or None
-        Feature column names (needed if loading model from checkpoint).
-    batch_size : int or None
-        Batch size for inference.
-
     Returns
     -------
     predictions : dict
         {sample_id: predicted_ghi} for all test samples.
+    fallback_ids : list
+        IDs that used MDSSF fallback (for logging).
     """
     device = get_device()
     batch_size = batch_size or HPARAMS['batch_size'] * 4
@@ -89,17 +78,18 @@ def predict(dataset, models=None, model_paths: list = None,
         for batch in loader:
             x = batch['x'].to(device)
             station_idx = batch['station_idx'].to(device)
+            mdssf_ghi = batch['mdssf_ghi'].to(device)
             clear_sky = batch['clear_sky_ghi'].to(device)
             is_night = batch['is_night'].to(device)
             is_test = batch['is_test'].numpy()
             sample_ids = batch['sample_id']
 
             ensemble_ghi = []
-            
+
             for m in models:
-                _, ghi_pred = m(x, station_idx, clear_sky, is_night)
+                _, ghi_pred = m(x, station_idx, mdssf_ghi, clear_sky, is_night)
                 ensemble_ghi.append(ghi_pred.cpu().numpy())
-                
+
             # Average across the ensemble
             ghi_np = np.mean(ensemble_ghi, axis=0)
 
@@ -117,13 +107,23 @@ def predict(dataset, models=None, model_paths: list = None,
     return predictions
 
 
-def generate_submission(predictions: dict, output_path: str = None):
+def generate_submission(predictions: dict, output_path: str = None,
+                        fallback_df: pd.DataFrame = None):
     """
     Generate Zindi-format submission CSV.
 
-    Format:
-        ID, TargetMBE, TargetRMSE
-        (TargetMBE and TargetRMSE are identical per Zindi rules)
+    CRITICAL FIX: Missing predictions (983 IDs from window boundary effects)
+    are filled with MDSSF satellite values instead of 0.0.
+
+    Parameters
+    ----------
+    predictions : dict
+        {sample_id: predicted_ghi} from model inference.
+    output_path : str
+        Path to save submission CSV.
+    fallback_df : pd.DataFrame or None
+        DataFrame with 'ID' and 'mdssf' columns for fallback values.
+        If None, uses max(0, MDSSF) where available, else 0.
     """
     ensure_dirs()
 
@@ -140,19 +140,32 @@ def generate_submission(predictions: dict, output_path: str = None):
         all_ids = list(predictions.keys())
         print(f"  Using prediction IDs: {len(all_ids)} rows")
 
+    # Build fallback lookup from MDSSF satellite values
+    fallback_lookup = {}
+    if fallback_df is not None and 'ID' in fallback_df.columns and 'mdssf' in fallback_df.columns:
+        for _, row in fallback_df[['ID', 'mdssf']].dropna().iterrows():
+            fallback_lookup[row['ID']] = max(0.0, float(row['mdssf']))
+        print(f"  Fallback MDSSF values loaded for {len(fallback_lookup)} IDs")
+
     # Build submission
     rows = []
     missing_count = 0
+    fallback_count = 0
     for sid in all_ids:
         if sid in predictions:
             val = predictions[sid]
+        elif sid in fallback_lookup:
+            val = fallback_lookup[sid]
+            fallback_count += 1
         else:
             val = 0.0
             missing_count += 1
         rows.append({'ID': sid, 'TargetMBE': val, 'TargetRMSE': val})
 
+    if fallback_count > 0:
+        print(f"  INFO: {fallback_count} test IDs used MDSSF satellite fallback")
     if missing_count > 0:
-        print(f"  WARNING: {missing_count} test IDs had no prediction (filled with 0)")
+        print(f"  WARNING: {missing_count} test IDs had no prediction or fallback (filled with 0)")
 
     submission = pd.DataFrame(rows)
 
@@ -165,3 +178,34 @@ def generate_submission(predictions: dict, output_path: str = None):
           f"{submission['TargetMBE'].max():.2f}]")
 
     return submission
+
+
+def stack_predictions(bilstm_preds, lgbm_preds, w_bilstm=0.4, w_lgbm=0.6):
+    """
+    Simple weighted ensemble stacking.
+
+    Parameters
+    ----------
+    bilstm_preds : dict or np.ndarray
+        BiLSTM GHI predictions.
+    lgbm_preds : dict or np.ndarray
+        LightGBM GHI predictions.
+    w_bilstm : float
+        Weight for BiLSTM (default: 0.4).
+    w_lgbm : float
+        Weight for LightGBM (default: 0.6).
+
+    Returns
+    -------
+    stacked : dict or np.ndarray (same type as input)
+    """
+    if isinstance(bilstm_preds, dict):
+        stacked = {}
+        all_keys = set(bilstm_preds.keys()) | set(lgbm_preds.keys())
+        for key in all_keys:
+            bi_val = bilstm_preds.get(key, 0.0)
+            lgb_val = lgbm_preds.get(key, 0.0)
+            stacked[key] = max(0.0, w_bilstm * bi_val + w_lgbm * lgb_val)
+        return stacked
+    else:
+        return np.maximum(0.0, w_bilstm * bilstm_preds + w_lgbm * lgbm_preds)

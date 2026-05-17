@@ -1,25 +1,23 @@
 """
 Physics-Informed BiLSTM for solar radiation reconstruction.
-Predicts clearness index (kt) directly, then reconstructs GHI.
+Predicts RAW RESIDUAL (GHI_true - MDSSF) directly, then reconstructs GHI.
 
-Architecture (V1 reverted + per-station bias):
+Architecture (Hybrid V2 -- residual learning):
     Input (batch, seq_len, n_features + embed_dim)
       -> LayerNorm
       -> BiLSTM (2 layers, bidirectional)
       -> Center timestep extraction
-      -> Linear Head -> Sigmoid -> kt in [0, 1]
-      -> GHI = kt * clear_sky_ghi * day_mask
+      -> Linear Head -> unbounded residual prediction
+      -> GHI = MDSSF + residual (clamped to [0, 1.3*clear_sky])
+      -> Night gate: GHI = 0 when is_night == 1
 
 Key design decisions (multi-AI consensus):
-    1. Direct kt prediction (sigmoid-bounded) -- NOT delta_kt residual correction
-    2. Per-station scalar bias embedding for TAHMO sensor drift (~2%/year)
-    3. No CNN, no Transformer, no FiLM, no attention
-    4. Hard night gate: GHI = 0 when is_night == 1
-
-References:
-    - NotebookLM [12]: CNN-BiLSTM RMSE=19.53, Attention-LSTM RMSE=30.64
-    - Perplexity: "Direct kt prediction is cleaner optimization problem"
-    - ChatGPT: "optimization geometry matters more than architecture sophistication"
+    1. Residual prediction (GHI - MDSSF) -- NOT kt, NOT absolute GHI
+       "Satellite does 90% of the work" (Perplexity, ChatGPT, Gemini)
+    2. No sigmoid -- residuals are unbounded [-200, 200] W/m2
+    3. Per-station scalar bias embedding for TAHMO sensor drift (~2%/year)
+    4. Physical clamping: GHI in [0, 1.3*clear_sky_ghi]
+    5. Hard night gate: GHI = 0 when is_night == 1
 """
 
 import torch
@@ -65,8 +63,9 @@ class PhysicsInformedBiLSTM(nn.Module):
             dropout=dropout if n_layers > 1 else 0.0,
         )
 
-        # Output head: predict kt from center timestep hidden state
+        # Output head: predict residual from center timestep hidden state
         # BiLSTM output dim = 2 * hidden_dim (forward + backward)
+        # No sigmoid -- residuals are unbounded
         self.head = nn.Sequential(
             nn.Linear(hidden_dim * 2, hidden_dim),
             nn.GELU(),
@@ -85,27 +84,29 @@ class PhysicsInformedBiLSTM(nn.Module):
                 nn.init.orthogonal_(param)
             elif 'bias' in name:
                 nn.init.zeros_(param)
-        
+
         for module in self.head:
             if isinstance(module, nn.Linear):
                 nn.init.xavier_uniform_(module.weight)
                 nn.init.zeros_(module.bias)
 
     def forward(self, x: torch.Tensor, station_idx: torch.Tensor,
-                clear_sky_ghi: torch.Tensor, is_night: torch.Tensor):
+                mdssf_ghi: torch.Tensor, clear_sky_ghi: torch.Tensor,
+                is_night: torch.Tensor):
         """
-        Forward pass: predict kt directly, reconstruct GHI.
+        Forward pass: predict residual, reconstruct GHI.
 
         Parameters
         ----------
         x : (batch, seq_len, n_features) -- covariate window
         station_idx : (batch,) -- station index for embedding
-        clear_sky_ghi : (batch,) -- clear-sky GHI at center timestep
+        mdssf_ghi : (batch,) -- MDSSF satellite GHI at center timestep
+        clear_sky_ghi : (batch,) -- clear-sky GHI at center (for clamping)
         is_night : (batch,) -- binary nighttime flag at center timestep
 
         Returns
         -------
-        kt_pred : (batch,) -- predicted clearness index in [0, 1]
+        residual_pred : (batch,) -- predicted residual (GHI - MDSSF) in W/m2
         ghi_pred : (batch,) -- predicted GHI (W/m2)
         """
         batch_size, seq_len, _ = x.shape
@@ -125,24 +126,23 @@ class PhysicsInformedBiLSTM(nn.Module):
         center_idx = self.half_window
         h_center = lstm_out[:, center_idx, :]  # (batch, 2*hidden_dim)
 
-        # 5. Predict kt (bounded [0, 1] via sigmoid)
-        kt_logit = self.head(h_center).squeeze(-1)  # (batch,)
-        kt_pred = torch.sigmoid(kt_logit)
+        # 5. Predict residual (unbounded -- no sigmoid)
+        residual_pred = self.head(h_center).squeeze(-1)  # (batch,)
 
-        # 6. Apply per-station bias (additive correction to kt)
-        # Bias is small (~0.02 for 2% drift), clamped to [-0.15, 0.15]
+        # 6. Apply per-station bias (additive correction to residual)
         bias = self.station_bias(station_idx).squeeze(-1)  # (batch,)
-        kt_pred = kt_pred + bias
-        
-        # 7. Clamp kt to physical bounds [0, kt_max]
-        kt_max = HPARAMS.get('kt_max', 1.05)
-        kt_pred = torch.clamp(kt_pred, 0.0, kt_max)
+        residual_pred = residual_pred + bias
 
-        # 8. Reconstruct GHI
-        ghi_pred = kt_pred * clear_sky_ghi
+        # 7. Reconstruct GHI = MDSSF + residual
+        ghi_pred = mdssf_ghi + residual_pred
+
+        # 8. Physical clamping: GHI in [0, 1.3 * clear_sky_ghi]
+        # 1.3 accounts for cloud enhancement / lensing effects
+        ghi_upper = 1.3 * clear_sky_ghi
+        ghi_pred = torch.clamp(ghi_pred, 0.0, ghi_upper)
 
         # 9. Hard night gate: force GHI = 0 at night
         day_mask = (1.0 - is_night).float()
         ghi_pred = ghi_pred * day_mask
 
-        return kt_pred, ghi_pred
+        return residual_pred, ghi_pred

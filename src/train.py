@@ -1,13 +1,12 @@
 """
-Training loop for the Physics-Informed BiLSTM (V1 reverted).
-Temporal CV: odd months train, even months validate.
+Training loop for the Hybrid BiLSTM (residual prediction).
+Temporal CV: odd months train, specified months validate.
 
-Simplified from the over-engineered PatchTransformer version:
+Architecture (Hybrid V2):
   - FP32 training (no AMP autocast swings)
-  - Direct Zindi loss on GHI (no proxy delta_kt MSE)
-  - No curriculum learning, no SWA, no loss annealing
-  - AdamW + CosineAnnealingLR + early stopping
-  - Clean, auditable, reproducible
+  - Huber loss on GHI (not Zindi loss -- prevents MBE/RMSE oscillation)
+  - ReduceLROnPlateau (not CosineAnnealing -- better for noisy data)
+  - AdamW + early stopping + gradient clipping
 """
 
 import os
@@ -18,7 +17,7 @@ from torch.utils.data import DataLoader, Subset
 
 from src.config import HPARAMS, PATHS, SEED, WANDB_CONFIG, seed_everything, ensure_dirs, get_n_stations
 from src.model_lstm import PhysicsInformedBiLSTM
-from src.loss import ZindiLoss, compute_zindi_score
+from src.loss import SolarHuberLoss, compute_zindi_score
 from src.utils import timer, get_device, clean_memory
 
 try:
@@ -39,7 +38,7 @@ def get_train_val_indices(dataset, val_months: list = None):
     val_indices = []
 
     for i, sample in enumerate(dataset.samples):
-        if sample['is_test'] == 1 or np.isnan(sample['target_kt']):
+        if sample['is_test'] == 1 or np.isnan(sample['target_ghi']):
             continue
         month = sample['month']
         if month in val_months:
@@ -51,16 +50,15 @@ def get_train_val_indices(dataset, val_months: list = None):
 
 
 # ------------------------------------------------------------------
-# Main Training Function (V1 reverted: simple and stable)
+# Main Training Function (Hybrid V2: residual + Huber + ReduceLROnPlateau)
 # ------------------------------------------------------------------
 def train_model(dataset, feature_cols: list, val_months: list = None,
                 model_save_dir: str = None, use_wandb: bool = False):
     """
-    Train the Physics-Informed BiLSTM with direct Zindi loss.
-    
-    FP32 training, AdamW + CosineAnnealing, early stopping.
-    No curriculum, no SWA, no loss annealing.
-    
+    Train the Physics-Informed BiLSTM with Huber loss on GHI residuals.
+
+    FP32 training, AdamW + ReduceLROnPlateau, early stopping.
+
     Returns: model, history, best_model_path
     """
     seed_everything(SEED)
@@ -125,9 +123,9 @@ def train_model(dataset, feature_cols: list, val_months: list = None,
     ).to(device)
 
     param_count = sum(p.numel() for p in model.parameters())
-    print(f"  Model: PhysicsInformedBiLSTM (direct kt prediction)")
+    print(f"  Model: PhysicsInformedBiLSTM (residual prediction)")
     print(f"  Parameters: {param_count:,}")
-    print(f"  Param/sample ratio: {param_count / len(train_indices):.2f}")
+    print(f"  Param/sample ratio: {param_count / max(len(train_indices), 1):.2f}")
 
     # Optimizer: AdamW
     optimizer = torch.optim.AdamW(
@@ -136,27 +134,31 @@ def train_model(dataset, feature_cols: list, val_months: list = None,
         weight_decay=HPARAMS['weight_decay'],
     )
 
-    # LR Scheduler: CosineAnnealing (decays to near-zero by end)
-    total_epochs = HPARAMS['epochs']
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+    # LR Scheduler: ReduceLROnPlateau (multi-AI consensus: better for noisy data)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer,
-        T_max=total_epochs,
-        eta_min=1e-6,
+        mode='min',
+        factor=0.5,
+        patience=10,
+        min_lr=1e-6,
     )
 
-    # Loss: Direct Zindi metric on GHI
-    criterion = ZindiLoss(
-        lambda_smooth=HPARAMS.get('lambda_smooth', 0.001),
+    # Loss: Huber on GHI (NOT Zindi loss)
+    huber_delta = HPARAMS.get('huber_delta', 50.0)
+    criterion = SolarHuberLoss(
+        delta=huber_delta,
         lambda_night=0.1
     )
 
     # History
-    history = {'train_loss': [], 'val_loss': [], 'val_mbe': [], 'val_rmse': [], 
+    history = {'train_loss': [], 'val_loss': [], 'val_mbe': [], 'val_rmse': [],
                'val_zindi': [], 'lr': []}
     best_val_score = float('inf')
     patience_counter = 0
+    total_epochs = HPARAMS['epochs']
 
-    print(f"\n[TRAIN] Starting {total_epochs} epochs (FP32, direct Zindi loss)")
+    print(f"\n[TRAIN] Starting {total_epochs} epochs "
+          f"(FP32, Huber delta={huber_delta}, ReduceLROnPlateau)")
 
     for epoch in range(total_epochs):
         # ---- Training ----
@@ -166,17 +168,18 @@ def train_model(dataset, feature_cols: list, val_months: list = None,
         for batch in train_loader:
             x = batch['x'].to(device)
             station_idx = batch['station_idx'].to(device)
+            mdssf_ghi = batch['mdssf_ghi'].to(device)
             clear_sky = batch['clear_sky_ghi'].to(device)
             is_night = batch['is_night'].to(device)
             target_ghi = batch['target_ghi'].to(device)
 
             optimizer.zero_grad(set_to_none=True)
 
-            # Forward (FP32)
-            kt_pred, ghi_pred = model(x, station_idx, clear_sky, is_night)
-            
-            # Zindi loss
-            loss, loss_dict = criterion(kt_pred, ghi_pred, target_ghi, is_night)
+            # Forward (FP32, residual prediction)
+            residual_pred, ghi_pred = model(x, station_idx, mdssf_ghi, clear_sky, is_night)
+
+            # Huber loss on GHI
+            loss, loss_dict = criterion(residual_pred, ghi_pred, target_ghi, is_night)
 
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), HPARAMS['grad_clip'])
@@ -184,7 +187,6 @@ def train_model(dataset, feature_cols: list, val_months: list = None,
 
             train_losses.append(loss_dict['loss'])
 
-        scheduler.step()
         avg_train_loss = np.mean(train_losses)
 
         # ---- Validation ----
@@ -196,11 +198,12 @@ def train_model(dataset, feature_cols: list, val_months: list = None,
             for batch in val_loader:
                 x = batch['x'].to(device)
                 station_idx = batch['station_idx'].to(device)
+                mdssf_ghi = batch['mdssf_ghi'].to(device)
                 clear_sky = batch['clear_sky_ghi'].to(device)
                 is_night = batch['is_night'].to(device)
                 target_ghi = batch['target_ghi']
 
-                _, ghi_pred = model(x, station_idx, clear_sky, is_night)
+                _, ghi_pred = model(x, station_idx, mdssf_ghi, clear_sky, is_night)
 
                 val_preds.extend(ghi_pred.cpu().numpy())
                 val_targets.extend(target_ghi.numpy())
@@ -208,7 +211,7 @@ def train_model(dataset, feature_cols: list, val_months: list = None,
         val_preds = np.array(val_preds)
         val_targets = np.array(val_targets)
 
-        # Zindi metrics (numpy)
+        # Zindi metrics (numpy) -- for evaluation only
         valid = ~np.isnan(val_targets)
         if valid.sum() > 0:
             residuals = val_preds[valid] - val_targets[valid]
@@ -225,6 +228,9 @@ def train_model(dataset, feature_cols: list, val_months: list = None,
         history['val_rmse'].append(val_rmse)
         history['val_zindi'].append(val_zindi)
         history['lr'].append(current_lr)
+
+        # Step scheduler on validation Zindi score
+        scheduler.step(val_zindi)
 
         # Logging
         if (epoch + 1) % 5 == 0 or epoch == 0:

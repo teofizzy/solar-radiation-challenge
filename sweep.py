@@ -192,9 +192,13 @@ def run_sweep_agent(config=None):
             
             predictions = predict(test_dataset, models=[model], feature_cols=feature_cols)
             
+            # Build fallback DataFrame for missing predictions (MDSSF satellite values)
+            test_mask = df['is_test'] == 1
+            fallback_df = df.loc[test_mask, ['ID', 'mdssf']].copy() if 'ID' in df.columns and 'mdssf' in df.columns else None
+            
             sub_filename = f"submission_{run_name}.csv"
             sub_path = os.path.join(PATHS['submissions_dir'], sub_filename)
-            submission_df = generate_submission(predictions, output_path=sub_path)
+            submission_df = generate_submission(predictions, output_path=sub_path, fallback_df=fallback_df)
             
             # Log submission to W&B as an artifact
             artifact = wandb.Artifact(name=f"submission_{run_name}", type="submission")
@@ -337,16 +341,16 @@ def get_default_sweep_config():
         'parameters': {
             # BiLSTM Architecture
             'hidden_dim':        {'values': [128, 160, 192, 256]},
-            'n_layers':          {'values': [2, 3]},
+            'n_layers':          {'value': 2},  # LOCKED: 3L causes gradient explosion
             'dropout':           {'distribution': 'uniform', 'min': 0.05, 'max': 0.30},
             'station_embed_dim': {'values': [8, 16, 32]},
-            
+
             # Optimization
             'lr':                {'distribution': 'log_uniform_values', 'min': 3e-4, 'max': 3e-3},
             'weight_decay':      {'distribution': 'log_uniform_values', 'min': 1e-5, 'max': 1e-3},
-            
-            # Loss regularization
-            'lambda_smooth':     {'distribution': 'log_uniform_values', 'min': 1e-4, 'max': 1e-2},
+
+            # Loss: Huber delta (multi-AI consensus: sweep over [30, 50, 70, 100])
+            'huber_delta':       {'values': [30, 50, 70, 100]},
         }
     }
 
