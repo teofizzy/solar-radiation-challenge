@@ -35,12 +35,15 @@ def get_feature_hash(feature_cols):
 
 # W&B Login will be handled in the __main__ block via --api_key or environment variables.
 
-from src.config import WANDB_CONFIG, HPARAMS, PATHS
+from src.config import WANDB_CONFIG, HPARAMS, STAGE2_HPARAMS, PATHS
 from src.dataset import SolarDataset
-from pipeline import build_pipeline_data
+from pipeline import build_pipeline_data, _extract_features_for_samples
 from src.train import train_model
-from src.predict import predict, generate_submission
+from src.predict import predict, generate_submission, stack_predictions
 from src.dataset import create_test_dataset
+
+# Module-level flag set by CLI --with-lgbm
+USE_LGBM = False
 
 
 # ------------------------------------------------------------------
@@ -129,6 +132,12 @@ def run_sweep_agent(config=None):
     """
     The function that W&B will call for each trial in the sweep.
     It reads the hyperparams from wandb.config and trains the model.
+    
+    If USE_LGBM is True, each trial also runs:
+      1. BiLSTM training with OOF collection
+      2. LightGBM sqrt-residual training on OOF
+      3. Weighted ensemble + per-station calibration
+      4. Final stacked Zindi score logged as the sweep metric
     """
     # Initialize wandb run
     with wandb.init(project=WANDB_CONFIG['project'], entity=WANDB_CONFIG['entity']):
@@ -142,6 +151,7 @@ def run_sweep_agent(config=None):
         # The train.py will read HPARAMS['lambda_smooth'] when constructing the loss
         
         print(f"\n[SWEEP] Starting trial with config: {config}")
+        print(f"[SWEEP] LightGBM stacking: {'ENABLED' if USE_LGBM else 'DISABLED'}")
         
         # Load Data AFTER HPARAMS update to ensure correct seq_len
         df, feature_cols = build_pipeline_data()
@@ -153,6 +163,7 @@ def run_sweep_agent(config=None):
             'meta/git_hash': get_git_hash(),
             'meta/feature_hash': get_feature_hash(feature_cols),
             'meta/seed': SEED,
+            'meta/use_lgbm': USE_LGBM,
         })
         
         # Pull experiments_dir from PATHS (not HPARAMS)
@@ -160,19 +171,109 @@ def run_sweep_agent(config=None):
         sweep_save_dir = os.path.join(PATHS['experiments_dir'], f"sweep_{run_name}")
         
         try:
-            model, history, best_model_path = train_model(
+            # ---- Stage 1: BiLSTM Training ----
+            result = train_model(
                 dataset, 
                 feature_cols, 
                 val_months=[3, 7, 11], # Standard competition temporal validation
                 model_save_dir=sweep_save_dir,
-                use_wandb=True
+                use_wandb=True,
+                collect_oof=USE_LGBM,  # Collect OOF only when stacking
             )
             
-            best_zindi = min(history['val_zindi_score']) if 'val_zindi_score' in history else min(history['val_zindi'])
-            print(f"[SWEEP] Trial finished. Best Zindi Score: {best_zindi:.4f}")
+            if USE_LGBM:
+                model, history, best_model_path, oof_data = result
+            else:
+                model, history, best_model_path = result
+                oof_data = None
+            
+            bilstm_zindi = min(history['val_zindi'])
+            best_idx = np.argmin(history['val_zindi'])
+            print(f"[SWEEP] BiLSTM best Zindi: {bilstm_zindi:.4f}")
+            
+            # ---- Stage 2: LightGBM Stacking (if enabled) ----
+            final_zindi = bilstm_zindi
+            lgbm_model = None
+            station_ratios = None
+            
+            if USE_LGBM and oof_data and len(oof_data) > 0:
+                from src.stage2_lgbm import Stage2LightGBM
+                from src.calibrate import compute_station_ratios, apply_calibration
+                
+                print(f"\n[SWEEP] Stage 2: LightGBM on {len(oof_data)} OOF samples...")
+                
+                # Convert OOF to arrays
+                oof_ghi_true = np.array([r['ghi_true'] for r in oof_data])
+                oof_mdssf = np.array([r['mdssf_ghi'] for r in oof_data])
+                oof_bilstm = np.array([r['ghi_pred'] for r in oof_data])
+                oof_stations = np.array([r['station_idx'] for r in oof_data])
+                oof_sample_ids = [r['sample_id'] for r in oof_data]
+                
+                # Build tabular features for OOF samples
+                oof_features_df = _extract_features_for_samples(
+                    df, dataset, oof_sample_ids, feature_cols
+                )
+                
+                # Train LightGBM
+                lgbm_model = Stage2LightGBM()
+                lgbm_model.fit(
+                    ghi_true=oof_ghi_true,
+                    mdssf=oof_mdssf,
+                    features_df=oof_features_df,
+                    bilstm_preds=oof_bilstm,
+                )
+                
+                # Save LightGBM model
+                lgbm_save_path = os.path.join(sweep_save_dir, 'stage2_lgbm.pkl')
+                lgbm_model.save(lgbm_save_path)
+                
+                # Get LightGBM OOF predictions for calibration
+                oof_lgbm_preds = lgbm_model.predict(
+                    mdssf=oof_mdssf,
+                    features_df=oof_features_df,
+                    bilstm_preds=oof_bilstm,
+                )
+                
+                # Ensemble OOF predictions
+                oof_stacked = stack_predictions(oof_bilstm, oof_lgbm_preds)
+                
+                # Per-station calibration ratios
+                valid_oof = ~np.isnan(oof_ghi_true) & (oof_ghi_true > 0)
+                station_ratios = compute_station_ratios(
+                    y_true=oof_ghi_true[valid_oof],
+                    y_pred=oof_stacked[valid_oof],
+                    station_ids=oof_stations[valid_oof],
+                )
+                
+                # Calibrated OOF score (this is what the leaderboard will see)
+                oof_calibrated = apply_calibration(
+                    oof_stacked[valid_oof],
+                    oof_stations[valid_oof],
+                    station_ratios,
+                )
+                residuals = oof_calibrated - oof_ghi_true[valid_oof]
+                stacked_mbe = float(np.abs(np.mean(residuals)))
+                stacked_rmse = float(np.sqrt(np.mean(residuals ** 2)))
+                final_zindi = 0.5 * stacked_mbe + 0.5 * stacked_rmse
+                
+                print(f"[SWEEP] Stacked Zindi: {final_zindi:.4f} "
+                      f"(BiLSTM-only: {bilstm_zindi:.4f}, "
+                      f"improvement: {bilstm_zindi - final_zindi:.4f})")
+                
+                wandb.log({
+                    'val/bilstm_zindi': bilstm_zindi,
+                    'val/stacked_mbe': stacked_mbe,
+                    'val/stacked_rmse': stacked_rmse,
+                    'val/stacked_zindi': final_zindi,
+                    'val/lgbm_improvement': bilstm_zindi - final_zindi,
+                })
+            
+            # Log the FINAL score (stacked if LGBM, else BiLSTM-only)
+            # This is what the Bayesian optimizer sees
+            wandb.log({'val/zindi_score': final_zindi})
+            print(f"[SWEEP] Trial finished. Final Zindi Score: {final_zindi:.4f}")
 
             # ---- Global Best Model Update ----
-            best_idx = np.argmin(history['val_zindi_score']) if 'val_zindi_score' in history else np.argmin(history['val_zindi'])
             provenance = {
                 'sweep_id': getattr(wandb.run, 'sweep_id', None),
                 'run_id': wandb.run.id,
@@ -181,16 +282,47 @@ def run_sweep_agent(config=None):
                 'best_epoch': int(best_idx),
                 'val_mbe': float(history['val_mbe'][best_idx]),
                 'val_rmse': float(history['val_rmse'][best_idx]),
-                'val_zindi': float(best_zindi),
+                'val_zindi': float(final_zindi),
+                'use_lgbm': USE_LGBM,
             }
-            try_update_global_best(best_model_path, best_zindi, provenance)
+            try_update_global_best(best_model_path, final_zindi, provenance)
 
             # ---- Inference & Submission Logging ----
             print(f"[SWEEP] Generating submission for run {run_name}...")
             scaler_stats = dataset.get_scaler_stats()
             test_dataset = create_test_dataset(df, feature_cols, scaler_stats, hparams=HPARAMS)
             
-            predictions = predict(test_dataset, models=[model], feature_cols=feature_cols)
+            if USE_LGBM and lgbm_model is not None:
+                # Full stacked inference
+                bilstm_preds, test_details = predict(
+                    test_dataset, models=[model], feature_cols=feature_cols,
+                    return_details=True,
+                )
+                
+                test_sample_ids = [d['sample_id'] for d in test_details]
+                test_mdssf = np.array([d['mdssf_ghi'] for d in test_details])
+                test_bilstm = np.array([d['ghi_pred'] for d in test_details])
+                test_stations = np.array([d['station_idx'] for d in test_details])
+                
+                test_features_df = _extract_features_for_samples(
+                    df, dataset, test_sample_ids, feature_cols
+                )
+                
+                lgbm_test_preds = lgbm_model.predict(
+                    mdssf=test_mdssf,
+                    features_df=test_features_df,
+                    bilstm_preds=test_bilstm,
+                )
+                
+                stacked_test = stack_predictions(test_bilstm, lgbm_test_preds)
+                calibrated_test = apply_calibration(stacked_test, test_stations, station_ratios)
+                
+                predictions = {}
+                for i, sid in enumerate(test_sample_ids):
+                    predictions[sid] = float(calibrated_test[i])
+            else:
+                # BiLSTM-only inference
+                predictions = predict(test_dataset, models=[model], feature_cols=feature_cols)
             
             # Build fallback DataFrame for missing predictions (MDSSF satellite values)
             test_mask = df['is_test'] == 1
@@ -349,8 +481,8 @@ def get_default_sweep_config():
             'lr':                {'distribution': 'log_uniform_values', 'min': 3e-4, 'max': 3e-3},
             'weight_decay':      {'distribution': 'log_uniform_values', 'min': 1e-5, 'max': 1e-3},
 
-            # Loss: Huber delta (multi-AI consensus: sweep over [30, 50, 70, 100])
-            'huber_delta':       {'values': [30, 50, 70, 100]},
+            # ZindiLoss: kt smoothness penalty (solar-sweep-1 used ~0.008)
+            'lambda_smooth':     {'distribution': 'log_uniform_values', 'min': 1e-4, 'max': 1e-2},
         }
     }
 
@@ -448,7 +580,14 @@ if __name__ == '__main__':
         '--api_key', type=str, default=None,
         help='W&B API Key for authentication (useful for Colab).'
     )
+    parser.add_argument(
+        '--with-lgbm', action='store_true',
+        help='Enable LightGBM stacking + calibration in each trial.'
+    )
     args = parser.parse_args()
+    
+    # Set module-level LightGBM flag
+    USE_LGBM = args.with_lgbm
     
     # Handle Login
     api_key = args.api_key or os.environ.get('WANDB_API_KEY')

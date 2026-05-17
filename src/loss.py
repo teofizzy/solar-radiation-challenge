@@ -1,20 +1,18 @@
 """
-Loss functions for the Hybrid BiLSTM + LightGBM pipeline.
+Direct Zindi Loss for solar radiation reconstruction.
 
-Training loss: SolarHuberLoss (Huber on GHI, daytime only)
-Evaluation metric: ZindiLoss (0.5 * |MBE| + 0.5 * RMSE) -- NOT for training
+Computes the exact Zindi leaderboard metric as the training loss:
+    loss = 0.5 * |MBE| + 0.5 * RMSE
 
-Multi-AI Consensus:
-    - NotebookLM [1-3]: "MSE/Huber for training, Zindi for evaluation"
-    - ChatGPT: "Huber or MSE on residuals, NOT direct Zindi loss"
-    - Gemini: "Huber loss -- robust to outliers in meteorological data"
-    - Perplexity: "Direct Zindi loss causes MBE/RMSE oscillation"
+Where:
+    MBE  = mean(ghi_pred - ghi_true)  (Mean Bias Error in W/m2)
+    RMSE = sqrt(mean((ghi_pred - ghi_true)^2))  (Root Mean Squared Error in W/m2)
 
-Design:
-    - Huber delta is sweepable (default=50 W/m2, range [30, 100])
-    - Large delta -> behaves like MSE (penalizes large errors more)
-    - Small delta -> behaves like MAE (robust to outliers)
-    - MBE correction done via per-station ratio calibration, NOT loss function
+Proven in solar-sweep-1 (Zindi=45.48, MBE=2.12):
+    - Direct optimization of leaderboard metric was the KEY differentiator
+    - Huber loss caused MBE blowup (2.12 -> 9.06) because it ignores bias direction
+    - Perplexity: "Direct optimization of leaderboard metric was HUGE"
+    - ChatGPT: "No proxy mismatch, no latent reconstruction instability"
 """
 
 import torch
@@ -22,32 +20,28 @@ import torch.nn as nn
 import numpy as np
 
 
-class SolarHuberLoss(nn.Module):
-    """Huber loss on GHI (daytime only) with physics regularization.
+class ZindiLoss(nn.Module):
+    """Direct Zindi metric loss: 0.5 * |MBE| + 0.5 * RMSE on GHI.
 
-    Operates in GHI space (W/m2). Huber provides robustness to
-    sensor noise / dust storm outliers while maintaining smooth gradients.
+    Operates entirely in GHI space (W/m2), which is the evaluation space.
+    No proxy losses, no delta_kt indirection, no clear-sky weighting.
 
-    Parameters
-    ----------
-    delta : float
-        Huber transition point (W/m2). Sweepable via HPARAMS.
-    lambda_night : float
-        Penalty weight for nighttime GHI leakage.
+    Additional physics regularization:
+        - kt smoothness penalty (optional, weight=0.001)
+        - Night penalty (should be zero, catches leakage)
     """
-    def __init__(self, delta=50.0, lambda_night=0.1):
+    def __init__(self, lambda_smooth=0.001, lambda_night=0.1):
         super().__init__()
-        self.huber = nn.HuberLoss(delta=delta, reduction='mean')
+        self.lambda_smooth = lambda_smooth
         self.lambda_night = lambda_night
-        self.delta = delta
 
-    def forward(self, residual_pred, ghi_pred, target_ghi, is_night):
+    def forward(self, kt_pred, ghi_pred, target_ghi, is_night):
         """
-        Compute Huber loss on GHI predictions (daytime only).
+        Compute direct Zindi loss on GHI predictions.
 
         Parameters
         ----------
-        residual_pred : (B,) tensor -- predicted residual (GHI - MDSSF)
+        kt_pred : (B,) tensor -- predicted clearness index
         ghi_pred : (B,) tensor -- predicted GHI (W/m2)
         target_ghi : (B,) tensor -- observed GHI (W/m2), NaN for test
         is_night : (B,) tensor -- binary nighttime flag
@@ -67,11 +61,30 @@ class SolarHuberLoss(nn.Module):
 
         ghi_p = ghi_pred[valid]
         ghi_t = target_ghi[valid]
+        residuals = ghi_p - ghi_t
 
-        # 2. Huber loss on GHI (main training loss)
-        loss = self.huber(ghi_p, ghi_t)
+        # 2. MBE component: |mean(residuals)|
+        mbe = residuals.mean()
+        abs_mbe = torch.abs(mbe)
 
-        # 3. Night penalty: catch any night leakage past the hard gate
+        # 3. RMSE component: sqrt(mean(residuals^2))
+        # Add small epsilon inside sqrt for gradient stability at zero
+        rmse = torch.sqrt(torch.mean(residuals ** 2) + 1e-8)
+
+        # 4. Zindi score = 0.5 * |MBE| + 0.5 * RMSE
+        zindi_loss = 0.5 * abs_mbe + 0.5 * rmse
+
+        # 5. Physics regularization (optional, very weak)
+        loss = zindi_loss
+
+        # kt smoothness: penalize extreme kt values (should be smooth)
+        if self.lambda_smooth > 0:
+            kt_valid = kt_pred[valid]
+            # Penalize kt very far from 0.5 (helps convergence, not physics)
+            kt_penalty = torch.mean((kt_valid - 0.5) ** 2)
+            loss = loss + self.lambda_smooth * kt_penalty
+
+        # Night penalty: catch any night leakage past the hard gate
         if self.lambda_night > 0:
             night_mask = is_night > 0.5
             if night_mask.any():
@@ -79,7 +92,51 @@ class SolarHuberLoss(nn.Module):
                 night_penalty = torch.mean(night_ghi ** 2)
                 loss = loss + self.lambda_night * night_penalty
 
-        # 4. Metrics for logging (no gradient)
+        # 6. Metrics for logging (no gradient)
+        with torch.no_grad():
+            metrics = {
+                'loss': loss.item(),
+                'ghi_rmse': rmse.item(),
+                'mbe': mbe.item(),
+                'abs_mbe': abs_mbe.item(),
+                'zindi': zindi_loss.item(),
+            }
+
+        return loss, metrics
+
+
+class SolarHuberLoss(nn.Module):
+    """Huber loss on GHI (daytime only) with physics regularization.
+
+    KEPT for potential LightGBM Stage 2 training or future experimentation.
+    NOT used for BiLSTM training (Zindi loss is superior for this metric).
+    """
+    def __init__(self, delta=50.0, lambda_night=0.1):
+        super().__init__()
+        self.huber = nn.HuberLoss(delta=delta, reduction='mean')
+        self.lambda_night = lambda_night
+        self.delta = delta
+
+    def forward(self, kt_pred, ghi_pred, target_ghi, is_night):
+        valid = (~torch.isnan(target_ghi)) & (is_night < 0.5)
+
+        if valid.sum() == 0:
+            zero = torch.tensor(0.0, device=ghi_pred.device, requires_grad=True)
+            return zero, {'loss': 0.0, 'ghi_rmse': 0.0, 'mbe': 0.0,
+                         'abs_mbe': 0.0, 'zindi': 0.0}
+
+        ghi_p = ghi_pred[valid]
+        ghi_t = target_ghi[valid]
+
+        loss = self.huber(ghi_p, ghi_t)
+
+        if self.lambda_night > 0:
+            night_mask = is_night > 0.5
+            if night_mask.any():
+                night_ghi = ghi_pred[night_mask]
+                night_penalty = torch.mean(night_ghi ** 2)
+                loss = loss + self.lambda_night * night_penalty
+
         with torch.no_grad():
             residuals = ghi_p - ghi_t
             mbe = torch.mean(residuals)
@@ -96,41 +153,6 @@ class SolarHuberLoss(nn.Module):
             }
 
         return loss, metrics
-
-
-class ZindiLoss(nn.Module):
-    """Zindi metric: 0.5 * |MBE| + 0.5 * RMSE on GHI.
-
-    EVALUATION ONLY -- not used for training (causes oscillation).
-    Kept for validation scoring and sweep objective.
-    """
-    def forward(self, residual_pred, ghi_pred, target_ghi, is_night):
-        valid = (~torch.isnan(target_ghi)) & (is_night < 0.5)
-
-        if valid.sum() == 0:
-            zero = torch.tensor(0.0, device=ghi_pred.device, requires_grad=True)
-            return zero, {'loss': 0.0, 'ghi_rmse': 0.0, 'mbe': 0.0,
-                         'abs_mbe': 0.0, 'zindi': 0.0}
-
-        ghi_p = ghi_pred[valid]
-        ghi_t = target_ghi[valid]
-        residuals = ghi_p - ghi_t
-
-        mbe = residuals.mean()
-        abs_mbe = torch.abs(mbe)
-        rmse = torch.sqrt(torch.mean(residuals ** 2) + 1e-8)
-        zindi_loss = 0.5 * abs_mbe + 0.5 * rmse
-
-        with torch.no_grad():
-            metrics = {
-                'loss': zindi_loss.item(),
-                'ghi_rmse': rmse.item(),
-                'mbe': mbe.item(),
-                'abs_mbe': abs_mbe.item(),
-                'zindi': zindi_loss.item(),
-            }
-
-        return zindi_loss, metrics
 
 
 def compute_zindi_score(ghi_pred, ghi_target):

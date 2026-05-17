@@ -18,8 +18,11 @@ References:
 import numpy as np
 from scipy.optimize import minimize_scalar
 
+from src.config import STAGE2_HPARAMS
 
-def compute_station_ratios(y_true, y_pred, station_ids, min_samples=50):
+
+def compute_station_ratios(y_true, y_pred, station_ids, min_samples=50,
+                           clip_bounds=None):
     """
     Compute per-station multiplicative calibration ratios.
 
@@ -36,6 +39,8 @@ def compute_station_ratios(y_true, y_pred, station_ids, min_samples=50):
         Station identifiers.
     min_samples : int
         Minimum daytime samples per station (default: 50).
+    clip_bounds : list of [lo, hi] or None
+        Safety clipping for ratios. Default: from STAGE2_HPARAMS.
 
     Returns
     -------
@@ -45,13 +50,18 @@ def compute_station_ratios(y_true, y_pred, station_ids, min_samples=50):
     y_true = np.asarray(y_true, dtype=np.float64)
     y_pred = np.asarray(y_pred, dtype=np.float64)
 
+    if clip_bounds is None:
+        clip_bounds = STAGE2_HPARAMS.get('calibration_clip', [0.8, 1.2])
+
     ratios = {}
 
     for station in np.unique(station_ids):
         mask = (station_ids == station) & (~np.isnan(y_true)) & (y_pred > 1.0)
 
         if mask.sum() >= min_samples:
-            ratios[station] = y_true[mask].sum() / y_pred[mask].sum()
+            raw_ratio = y_true[mask].sum() / y_pred[mask].sum()
+            # Clip to safety bounds to prevent extreme corrections
+            ratios[station] = float(np.clip(raw_ratio, clip_bounds[0], clip_bounds[1]))
         else:
             ratios[station] = 1.0
 
@@ -61,6 +71,7 @@ def compute_station_ratios(y_true, y_pred, station_ids, min_samples=50):
     print(f"  Mean ratio: {np.mean(ratio_values):.4f}")
     print(f"  Std ratio:  {np.std(ratio_values):.4f}")
     print(f"  Range:      [{np.min(ratio_values):.4f}, {np.max(ratio_values):.4f}]")
+    print(f"  Clip bounds: {clip_bounds}")
 
     return ratios
 

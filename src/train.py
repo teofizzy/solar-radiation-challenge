@@ -1,12 +1,13 @@
 """
-Training loop for the Hybrid BiLSTM (residual prediction).
+Training loop for the Physics-Informed BiLSTM (direct kt prediction).
 Temporal CV: odd months train, specified months validate.
 
-Architecture (Hybrid V2):
+Architecture (solar-sweep-1 proven, Zindi=45.48):
   - FP32 training (no AMP autocast swings)
-  - Huber loss on GHI (not Zindi loss -- prevents MBE/RMSE oscillation)
-  - ReduceLROnPlateau (not CosineAnnealing -- better for noisy data)
+  - ZindiLoss (0.5*|MBE| + 0.5*RMSE) -- direct leaderboard metric
+  - CosineAnnealingLR (handles noisy ZindiLoss better than Plateau)
   - AdamW + early stopping + gradient clipping
+  - Model predicts kt -> GHI = kt * clear_sky_ghi
 """
 
 import os
@@ -17,7 +18,7 @@ from torch.utils.data import DataLoader, Subset
 
 from src.config import HPARAMS, PATHS, SEED, WANDB_CONFIG, seed_everything, ensure_dirs, get_n_stations
 from src.model_lstm import PhysicsInformedBiLSTM
-from src.loss import SolarHuberLoss, compute_zindi_score
+from src.loss import ZindiLoss, compute_zindi_score
 from src.utils import timer, get_device, clean_memory
 
 try:
@@ -50,16 +51,29 @@ def get_train_val_indices(dataset, val_months: list = None):
 
 
 # ------------------------------------------------------------------
-# Main Training Function (Hybrid V2: residual + Huber + ReduceLROnPlateau)
+# Main Training Function (solar-sweep-1: kt + ZindiLoss + CosineAnnealing)
 # ------------------------------------------------------------------
 def train_model(dataset, feature_cols: list, val_months: list = None,
-                model_save_dir: str = None, use_wandb: bool = False):
+                model_save_dir: str = None, use_wandb: bool = False,
+                collect_oof: bool = False):
     """
-    Train the Physics-Informed BiLSTM with Huber loss on GHI residuals.
+    Train the Physics-Informed BiLSTM with ZindiLoss on GHI.
 
-    FP32 training, AdamW + ReduceLROnPlateau, early stopping.
+    FP32 training, AdamW + CosineAnnealingLR, early stopping.
 
-    Returns: model, history, best_model_path
+    Parameters
+    ----------
+    dataset : SolarDataset
+    feature_cols : list of feature column names
+    val_months : list of int for validation months
+    model_save_dir : str
+    use_wandb : bool
+    collect_oof : bool
+        If True, collect out-of-fold predictions for LightGBM Stage 2.
+
+    Returns
+    -------
+    model, history, best_model_path, oof_data (if collect_oof=True)
     """
     seed_everything(SEED)
     ensure_dirs()
@@ -123,7 +137,7 @@ def train_model(dataset, feature_cols: list, val_months: list = None,
     ).to(device)
 
     param_count = sum(p.numel() for p in model.parameters())
-    print(f"  Model: PhysicsInformedBiLSTM (residual prediction)")
+    print(f"  Model: PhysicsInformedBiLSTM (direct kt prediction)")
     print(f"  Parameters: {param_count:,}")
     print(f"  Param/sample ratio: {param_count / max(len(train_indices), 1):.2f}")
 
@@ -134,19 +148,18 @@ def train_model(dataset, feature_cols: list, val_months: list = None,
         weight_decay=HPARAMS['weight_decay'],
     )
 
-    # LR Scheduler: ReduceLROnPlateau (multi-AI consensus: better for noisy data)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+    # LR Scheduler: CosineAnnealingLR (proven in solar-sweep-1)
+    total_epochs = HPARAMS['epochs']
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer,
-        mode='min',
-        factor=0.5,
-        patience=10,
-        min_lr=1e-6,
+        T_max=total_epochs,
+        eta_min=1e-6,
     )
 
-    # Loss: Huber on GHI (NOT Zindi loss)
-    huber_delta = HPARAMS.get('huber_delta', 50.0)
-    criterion = SolarHuberLoss(
-        delta=huber_delta,
+    # Loss: ZindiLoss (direct leaderboard metric)
+    lambda_smooth = HPARAMS.get('lambda_smooth', 0.001)
+    criterion = ZindiLoss(
+        lambda_smooth=lambda_smooth,
         lambda_night=0.1
     )
 
@@ -155,10 +168,9 @@ def train_model(dataset, feature_cols: list, val_months: list = None,
                'val_zindi': [], 'lr': []}
     best_val_score = float('inf')
     patience_counter = 0
-    total_epochs = HPARAMS['epochs']
 
     print(f"\n[TRAIN] Starting {total_epochs} epochs "
-          f"(FP32, Huber delta={huber_delta}, ReduceLROnPlateau)")
+          f"(FP32, ZindiLoss lambda_smooth={lambda_smooth}, CosineAnnealingLR)")
 
     for epoch in range(total_epochs):
         # ---- Training ----
@@ -168,18 +180,17 @@ def train_model(dataset, feature_cols: list, val_months: list = None,
         for batch in train_loader:
             x = batch['x'].to(device)
             station_idx = batch['station_idx'].to(device)
-            mdssf_ghi = batch['mdssf_ghi'].to(device)
             clear_sky = batch['clear_sky_ghi'].to(device)
             is_night = batch['is_night'].to(device)
             target_ghi = batch['target_ghi'].to(device)
 
             optimizer.zero_grad(set_to_none=True)
 
-            # Forward (FP32, residual prediction)
-            residual_pred, ghi_pred = model(x, station_idx, mdssf_ghi, clear_sky, is_night)
+            # Forward (FP32, direct kt prediction)
+            kt_pred, ghi_pred = model(x, station_idx, clear_sky, is_night)
 
-            # Huber loss on GHI
-            loss, loss_dict = criterion(residual_pred, ghi_pred, target_ghi, is_night)
+            # ZindiLoss on GHI
+            loss, loss_dict = criterion(kt_pred, ghi_pred, target_ghi, is_night)
 
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), HPARAMS['grad_clip'])
@@ -198,12 +209,11 @@ def train_model(dataset, feature_cols: list, val_months: list = None,
             for batch in val_loader:
                 x = batch['x'].to(device)
                 station_idx = batch['station_idx'].to(device)
-                mdssf_ghi = batch['mdssf_ghi'].to(device)
                 clear_sky = batch['clear_sky_ghi'].to(device)
                 is_night = batch['is_night'].to(device)
                 target_ghi = batch['target_ghi']
 
-                _, ghi_pred = model(x, station_idx, mdssf_ghi, clear_sky, is_night)
+                _, ghi_pred = model(x, station_idx, clear_sky, is_night)
 
                 val_preds.extend(ghi_pred.cpu().numpy())
                 val_targets.extend(target_ghi.numpy())
@@ -229,8 +239,8 @@ def train_model(dataset, feature_cols: list, val_months: list = None,
         history['val_zindi'].append(val_zindi)
         history['lr'].append(current_lr)
 
-        # Step scheduler on validation Zindi score
-        scheduler.step(val_zindi)
+        # Step CosineAnnealing scheduler (epoch-based, no val metric needed)
+        scheduler.step()
 
         # Logging
         if (epoch + 1) % 5 == 0 or epoch == 0:
@@ -285,5 +295,40 @@ def train_model(dataset, feature_cols: list, val_months: list = None,
         artifact.add_file(best_model_path)
         wandb.log_artifact(artifact)
 
+    # ---- Collect OOF predictions for LightGBM Stage 2 ----
+    oof_data = None
+    if collect_oof:
+        print("\n[TRAIN] Collecting OOF predictions for Stage 2...")
+        model.eval()
+        oof_records = []
+
+        with torch.no_grad():
+            for batch in val_loader:
+                x = batch['x'].to(device)
+                station_idx = batch['station_idx'].to(device)
+                clear_sky = batch['clear_sky_ghi'].to(device)
+                is_night = batch['is_night'].to(device)
+                target_ghi = batch['target_ghi'].numpy()
+                sample_ids = batch['sample_id']
+                mdssf_ghi = batch['mdssf_ghi'].numpy()
+                station_np = batch['station_idx'].numpy()
+
+                _, ghi_pred = model(x, station_idx, clear_sky, is_night)
+                ghi_pred_np = ghi_pred.cpu().numpy()
+
+                for j in range(len(ghi_pred_np)):
+                    oof_records.append({
+                        'sample_id': sample_ids[j],
+                        'ghi_pred': float(ghi_pred_np[j]),
+                        'ghi_true': float(target_ghi[j]),
+                        'mdssf_ghi': float(mdssf_ghi[j]),
+                        'station_idx': int(station_np[j]),
+                    })
+
+        oof_data = oof_records
+        print(f"  Collected {len(oof_data)} OOF samples")
+
     clean_memory()
+    if collect_oof:
+        return model, history, best_model_path, oof_data
     return model, history, best_model_path

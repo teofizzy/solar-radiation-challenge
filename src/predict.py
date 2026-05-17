@@ -1,9 +1,9 @@
 """
-Inference and submission generation for the Hybrid BiLSTM pipeline.
+Inference and submission generation for the Physics-Informed BiLSTM pipeline.
 
-Architecture (Hybrid V2):
-  - Model predicts: residual = GHI - MDSSF (raw residual)
-  - GHI = MDSSF + residual, clamped to [0, 1.3*clear_sky]
+Architecture (solar-sweep-1 proven):
+  - Model predicts: kt (clearness index, sigmoid-bounded [0, kt_max])
+  - GHI = kt * clear_sky_ghi, night-gated to 0
   - Missing predictions: use MDSSF satellite value (NOT 0)
   - FP32 inference (no AMP)
 """
@@ -14,22 +14,33 @@ import pandas as pd
 import torch
 from torch.utils.data import DataLoader
 
-from src.config import HPARAMS, PATHS, ensure_dirs, get_n_stations
+from src.config import HPARAMS, PATHS, STAGE2_HPARAMS, ensure_dirs, get_n_stations
 from src.model_lstm import PhysicsInformedBiLSTM
 from src.utils import get_device, clean_memory
 
 
 def predict(dataset, models=None, model_paths: list = None,
-            feature_cols: list = None, batch_size: int = None):
+            feature_cols: list = None, batch_size: int = None,
+            return_details: bool = False):
     """
     Run inference on the dataset and return predictions.
+
+    Parameters
+    ----------
+    dataset : SolarDataset
+    models : list of trained models (optional)
+    model_paths : list of checkpoint paths (optional)
+    feature_cols : list of feature names (optional, used if loading from checkpoints)
+    batch_size : int (optional)
+    return_details : bool
+        If True, return additional data needed for LightGBM Stage 2.
 
     Returns
     -------
     predictions : dict
         {sample_id: predicted_ghi} for all test samples.
-    fallback_ids : list
-        IDs that used MDSSF fallback (for logging).
+    details : list of dict (only if return_details=True)
+        Per-sample metadata for Stage 2 integration.
     """
     device = get_device()
     batch_size = batch_size or HPARAMS['batch_size'] * 4
@@ -73,21 +84,22 @@ def predict(dataset, models=None, model_paths: list = None,
     )
 
     predictions = {}
+    details_list = []
 
     with torch.no_grad():
         for batch in loader:
             x = batch['x'].to(device)
             station_idx = batch['station_idx'].to(device)
-            mdssf_ghi = batch['mdssf_ghi'].to(device)
             clear_sky = batch['clear_sky_ghi'].to(device)
             is_night = batch['is_night'].to(device)
             is_test = batch['is_test'].numpy()
             sample_ids = batch['sample_id']
+            mdssf_ghi = batch['mdssf_ghi'].numpy()
 
             ensemble_ghi = []
 
             for m in models:
-                _, ghi_pred = m(x, station_idx, mdssf_ghi, clear_sky, is_night)
+                _, ghi_pred = m(x, station_idx, clear_sky, is_night)
                 ensemble_ghi.append(ghi_pred.cpu().numpy())
 
             # Average across the ensemble
@@ -101,9 +113,20 @@ def predict(dataset, models=None, model_paths: list = None,
                     pred_val = max(0.0, pred_val)
                     predictions[sid] = pred_val
 
+                    if return_details:
+                        details_list.append({
+                            'sample_id': sid,
+                            'ghi_pred': pred_val,
+                            'mdssf_ghi': float(mdssf_ghi[i]),
+                            'station_idx': int(batch['station_idx'][i].item()),
+                        })
+
     print(f"[PREDICT] Generated {len(predictions)} test predictions "
           f"using {len(models)}-model ensemble")
     clean_memory()
+
+    if return_details:
+        return predictions, details_list
     return predictions
 
 
@@ -180,7 +203,7 @@ def generate_submission(predictions: dict, output_path: str = None,
     return submission
 
 
-def stack_predictions(bilstm_preds, lgbm_preds, w_bilstm=0.4, w_lgbm=0.6):
+def stack_predictions(bilstm_preds, lgbm_preds, w_bilstm=None, w_lgbm=None):
     """
     Simple weighted ensemble stacking.
 
@@ -191,14 +214,19 @@ def stack_predictions(bilstm_preds, lgbm_preds, w_bilstm=0.4, w_lgbm=0.6):
     lgbm_preds : dict or np.ndarray
         LightGBM GHI predictions.
     w_bilstm : float
-        Weight for BiLSTM (default: 0.4).
+        Weight for BiLSTM (default from STAGE2_HPARAMS).
     w_lgbm : float
-        Weight for LightGBM (default: 0.6).
+        Weight for LightGBM (default from STAGE2_HPARAMS).
 
     Returns
     -------
     stacked : dict or np.ndarray (same type as input)
     """
+    if w_bilstm is None:
+        w_bilstm = STAGE2_HPARAMS.get('w_bilstm', 0.4)
+    if w_lgbm is None:
+        w_lgbm = STAGE2_HPARAMS.get('w_lgbm', 0.6)
+
     if isinstance(bilstm_preds, dict):
         stacked = {}
         all_keys = set(bilstm_preds.keys()) | set(lgbm_preds.keys())

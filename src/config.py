@@ -102,7 +102,7 @@ HPARAMS = {
     'seq_len': 48,            # 12 hours @ 15-min cadence
     'half_window': 24,        # One side of the symmetric window
 
-    # BiLSTM Architecture (residual prediction)
+    # BiLSTM Architecture (direct kt prediction -- solar-sweep-1 proven)
     'hidden_dim': 160,        # BiLSTM hidden dim
     'n_layers': 2,            # 2-layer BiLSTM (locked -- 3L causes gradient explosion)
     'dropout': 0.15,          # Regularization
@@ -117,13 +117,33 @@ HPARAMS = {
     'grad_clip': 1.0,
     'use_amp': False,         # FP32 training
 
-    # Loss: SolarHuberLoss (NOT Zindi loss -- prevents oscillation)
-    'huber_delta': 50.0,      # Sweepable: [30, 50, 70, 100] W/m2
-    'lambda_smooth': 0.0,     # Smoothness penalty (if needed later)
+    # Loss: ZindiLoss (PROVEN in solar-sweep-1, Zindi=45.48)
+    'lambda_smooth': 0.001,   # kt smoothness penalty in ZindiLoss (sweepable)
 
     # Physics & Constraints
+    'kt_max': 1.05,           # Maximum clearness index (physical bound)
     'night_zenith_threshold': 90.0,
     'clearsky_min_denom': 1.0,
+}
+
+# ------------------------------------------------------------------
+# 2b. STAGE 2: LightGBM Configuration (parallel sqrt-residual)
+# ------------------------------------------------------------------
+STAGE2_HPARAMS = {
+    'n_estimators': 420,
+    'max_depth': 7,
+    'learning_rate': 0.02,
+    'num_leaves': 31,
+    'subsample': 0.8,
+    'colsample_bytree': 0.8,
+    'min_child_samples': 20,
+    'reg_alpha': 0.1,
+    'reg_lambda': 0.1,
+    # Ensemble weights
+    'w_bilstm': 0.4,
+    'w_lgbm': 0.6,
+    # Calibration bounds
+    'calibration_clip': [0.8, 1.2],
 }
 
 # ------------------------------------------------------------------
