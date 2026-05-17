@@ -1,10 +1,11 @@
 """
 Inference and submission generation.
-Loads trained model, runs prediction on test data, and outputs Zindi submission CSV.
+Loads trained BiLSTM model, runs prediction on test data, and outputs Zindi submission CSV.
 
-Updated for Stage 1 architecture:
-- Model forward signature uses cos_zenith instead of is_night
-- Single delta_kt head (no raw_correction)
+Updated for V1 reverted architecture:
+- Model forward: (x, station_idx, clear_sky_ghi, is_night) -> (kt_pred, ghi_pred)
+- No diag_vector, no atmos_feats, no center_kt_landsaf
+- FP32 inference
 """
 
 import os
@@ -14,7 +15,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from src.config import HPARAMS, PATHS, ensure_dirs, get_n_stations
-from src.model_patch import PhysicsInformedPatchTransformer
+from src.model_lstm import PhysicsInformedBiLSTM
 from src.utils import get_device, clean_memory
 
 
@@ -27,7 +28,7 @@ def predict(dataset, models=None, model_paths: list = None,
     ----------
     dataset : SolarDataset
         Dataset to predict on.
-    models : list of PhysicsInformedPatchTransformer or None
+    models : list of PhysicsInformedBiLSTM or None
         Trained models for ensembling.
     model_paths : list of str or None
         Paths to model checkpoints.
@@ -58,20 +59,18 @@ def predict(dataset, models=None, model_paths: list = None,
             n_features = len(ckpt.get('feature_cols', feature_cols or []))
             n_stations = get_n_stations()
 
-            m = PhysicsInformedPatchTransformer(
+            m = PhysicsInformedBiLSTM(
                 n_features=n_features,
                 n_stations=n_stations,
-                d_model=HPARAMS['hidden_dim'],
-                nhead=HPARAMS.get('transformer_heads', 8),
-                num_layers=HPARAMS['n_layers'],
-                patch_len=HPARAMS['patch_len'],
-                stride=HPARAMS['stride'],
+                hidden_dim=HPARAMS['hidden_dim'],
+                n_layers=HPARAMS['n_layers'],
+                embed_dim=HPARAMS.get('station_embed_dim', 16),
                 dropout=HPARAMS['dropout'],
             ).to(device)
             m.load_state_dict(ckpt['model_state_dict'])
             m.eval()
             models.append(m)
-            print(f"[PREDICT] Loaded Patch-Transformer from {path}")
+            print(f"[PREDICT] Loaded BiLSTM from {path}")
     else:
         for m in models:
             m.eval()
@@ -80,7 +79,7 @@ def predict(dataset, models=None, model_paths: list = None,
         dataset,
         batch_size=batch_size,
         shuffle=False,
-        num_workers=4,
+        num_workers=2,
         pin_memory=True,
     )
 
@@ -90,24 +89,15 @@ def predict(dataset, models=None, model_paths: list = None,
         for batch in loader:
             x = batch['x'].to(device)
             station_idx = batch['station_idx'].to(device)
-            diag_vector = batch['diag_vector'].to(device)
             clear_sky = batch['clear_sky_ghi'].to(device)
-            cos_zenith = batch['cos_zenith'].to(device)
-            center_kt_landsaf = batch['center_kt_landsaf'].to(device)
-            atmos_feats = batch['atmos_feats'].to(device)
+            is_night = batch['is_night'].to(device)
             is_test = batch['is_test'].numpy()
             sample_ids = batch['sample_id']
 
             ensemble_ghi = []
             
             for m in models:
-                # Force FP32 for inference stability
-                with torch.amp.autocast('cuda', enabled=False):
-                    _, ghi_pred = m(
-                        x.float(), station_idx, diag_vector.float(),
-                        clear_sky.float(), cos_zenith.float(),
-                        center_kt_landsaf.float(), atmos_feats.float()
-                    )
+                _, ghi_pred = m(x, station_idx, clear_sky, is_night)
                 ensemble_ghi.append(ghi_pred.cpu().numpy())
                 
             # Average across the ensemble
@@ -117,11 +107,12 @@ def predict(dataset, models=None, model_paths: list = None,
                 if is_test[i] == 1:
                     sid = sample_ids[i]
                     pred_val = float(ghi_np[i])
-                    # Post-processing: ensure non-negative
+                    # Physical constraint: non-negative
                     pred_val = max(0.0, pred_val)
                     predictions[sid] = pred_val
 
-    print(f"[PREDICT] Generated {len(predictions)} test predictions using {len(models)}-model ensemble")
+    print(f"[PREDICT] Generated {len(predictions)} test predictions "
+          f"using {len(models)}-model ensemble")
     clean_memory()
     return predictions
 
@@ -133,17 +124,6 @@ def generate_submission(predictions: dict, output_path: str = None):
     Format:
         ID, TargetMBE, TargetRMSE
         (TargetMBE and TargetRMSE are identical per Zindi rules)
-
-    Parameters
-    ----------
-    predictions : dict
-        {sample_id: predicted_ghi}
-    output_path : str or None
-        Path to save submission CSV.
-
-    Returns
-    -------
-    pd.DataFrame : submission DataFrame
     """
     ensure_dirs()
 
@@ -167,7 +147,6 @@ def generate_submission(predictions: dict, output_path: str = None):
         if sid in predictions:
             val = predictions[sid]
         else:
-            # Fallback: use a safe default (0.0 for missing predictions)
             val = 0.0
             missing_count += 1
         rows.append({'ID': sid, 'TargetMBE': val, 'TargetRMSE': val})

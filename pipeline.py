@@ -1,13 +1,15 @@
 """
 TAHMO Solar Radiation Challenge -- End-to-End Pipeline
-Physics-Informed BiLSTM for Solar Radiation Reconstruction
+Physics-Informed BiLSTM for Solar Radiation Reconstruction (V1 Reverted)
 
 This script orchestrates the full pipeline:
 Phase A (MVP): Config -> Data Loading -> Astro -> Dataset -> Model -> Train -> Predict
 Phase B (Enrichment): ERA5 -> Physics -> Temporal features
+Phase C (Satellite): LandSAF, TROPOMI, Static priors
+
+Architecture: BiLSTM (direct kt prediction) + LightGBM residual stacking
 
 Usage (Colab):
-    # Mount drive, upload data, then:
     %run pipeline.py
 
 Usage (local):
@@ -42,6 +44,9 @@ print(f"  Seed: {SEED}")
 print(f"  Feature toggles: {FEATURES}")
 print(f"  Seq len: {HPARAMS['seq_len']} ({HPARAMS['half_window']} past + "
       f"{HPARAMS['half_window']} future)")
+print(f"  Architecture: BiLSTM (hidden={HPARAMS['hidden_dim']}, "
+      f"layers={HPARAMS['n_layers']})")
+print(f"  Precision: FP32 (AMP disabled)")
 
 from src.data_loader import load_raw_data
 from src.feature_astro import compute_astro_features
@@ -130,7 +135,6 @@ def build_pipeline_data():
 
         df = compute_tropomi_features(df, force_recompute=False)
         gc.collect()
-
 
     # ------------------------------------------------------------------
     # 5. Temporal Features (Phase B.3)
@@ -233,7 +237,8 @@ def run_standard_pipeline():
     for i, fold in enumerate(folds):
         history = all_histories[i]
         best_idx = np.argmin(history['val_zindi'])
-        print(f"  {fold['name'].upper()} Best Zindi: {history['val_zindi'][best_idx]:.4f} (MBE: {history['val_mbe'][best_idx]:.2f}, RMSE: {history['val_rmse'][best_idx]:.2f})")
+        print(f"  {fold['name'].upper()} Best Zindi: {history['val_zindi'][best_idx]:.4f} "
+              f"(MBE: {history['val_mbe'][best_idx]:.2f}, RMSE: {history['val_rmse'][best_idx]:.2f})")
     print(f"  Submission rows:      {len(submission):,}")
     print(f"  Submission saved to:  {PATHS['submissions_dir']}")
 
@@ -248,5 +253,4 @@ if __name__ == '__main__':
         from sweep import start_sweep
         start_sweep()
     else:
-        # Standard mode
         run_standard_pipeline()

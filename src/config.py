@@ -98,48 +98,29 @@ PATHS = {
 # 2. MODEL HYPERPARAMETERS
 # ------------------------------------------------------------------
 HPARAMS = {
-    # Sequence / windowing
-    'seq_len': 192,           # 48 hours @ 15-min
-    'half_window': 96,        # One side of the symmetric window
+    # Sequence / windowing (V1 baseline: 12h symmetric)
+    'seq_len': 48,            # 12 hours @ 15-min cadence
+    'half_window': 24,        # One side of the symmetric window
     
-    # Patch-Transformer Architecture
-    'hidden_dim': 128,        # d_model (must be divisible by transformer_heads)
-    'n_layers': 4,            # Number of Transformer layers
-    'transformer_heads': 8,   # Must divide hidden_dim evenly
-    'dropout': 0.15,          # Slightly higher for regularization
-    'patch_len': 16,          # 4-hour patches
-    'stride': 8,              # 2-hour sliding stride
-    'station_embed_dim': 32,  # Latent projection of diagnostic features
+    # BiLSTM Architecture (V1 reverted + per-station bias)
+    'hidden_dim': 160,        # Slightly larger than V1 (128) for capacity
+    'n_layers': 2,            # 2-layer BiLSTM (V1 baseline)
+    'dropout': 0.15,          # Regularization
+    'station_embed_dim': 16,  # Station embedding dimension
     
-    # Training
-    'batch_size': 32,
-    'lr': 3e-4,               # Slightly higher LR for single-objective loss
+    # Training (FP32 -- no AMP to avoid autocast precision issues)
+    'batch_size': 64,         # V1 baseline
+    'lr': 1e-3,               # Standard Adam LR for BiLSTM
     'weight_decay': 1e-4,
-    'patience': 15,           # Increased patience for slower convergence
-    'epochs': 100,
+    'patience': 15,           # Early stopping patience
+    'epochs': 80,             # Sufficient for BiLSTM convergence
     'grad_clip': 1.0,
+    'use_amp': False,         # FP32 training (no autocast swings)
 
     # Physics & Constraints
-    'kt_max': 1.05,           # Physical kt upper bound (tightened from 1.5)
+    'kt_max': 1.05,           # Physical kt upper bound
     'night_zenith_threshold': 90.0,
     'clearsky_min_denom': 1.0,
-    
-    # Phase 2: Curriculum Learning (clear-sky -> clouds -> all)
-    # Reference: Perplexity + Deep Search consensus: 3-8 W/m2 RMSE reduction
-    'use_curriculum': True,
-    'curriculum_warmup_frac': 0.30,   # Epochs 0-30%: clear-sky emphasis
-    'curriculum_medium_frac': 0.60,   # Epochs 30-60%: broken clouds
-    
-    # Phase 3: Loss Annealing (MSE -> Huber at switch_frac) + MBE anchor
-    # Reference: ChatGPT: "Apply MBE in GHI space. lambda=0.005-0.02, start at 0.01"
-    'huber_delta_kt': 0.03,           # delta in kt-space (~20 W/m2 at noon)
-    'huber_switch_frac': 0.60,        # Switch from MSE to Huber at 60% epochs
-    'lambda_mbe': 0.01,               # GHI-space MBE anchor weight (prevents bias drift)
-    
-    # Phase 4: Stochastic Weight Averaging (SWA)
-    # Reference: ChatGPT consensus: 2-5 W/m2 RMSE reduction
-    'use_swa': True,
-    'swa_lr_ratio': 0.1,              # SWA LR = lr * 0.1
 }
 
 # ------------------------------------------------------------------
