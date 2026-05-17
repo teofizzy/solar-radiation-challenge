@@ -145,7 +145,10 @@ def train_model(dataset, feature_cols: list, val_months: list = None,
     )
 
     # Loss: Direct Zindi metric on GHI
-    criterion = ZindiLoss(lambda_smooth=0.001, lambda_night=0.1)
+    criterion = ZindiLoss(
+        lambda_smooth=HPARAMS.get('lambda_smooth', 0.001),
+        lambda_night=0.1
+    )
 
     # History
     history = {'train_loss': [], 'val_loss': [], 'val_mbe': [], 'val_rmse': [], 

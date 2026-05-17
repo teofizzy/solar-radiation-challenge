@@ -138,15 +138,11 @@ def run_sweep_agent(config=None):
         # 1. IMMEDIATE UPDATE: HPARAMS must be updated before any other imports/objects
         HPARAMS.update(config_dict)
         
+        # 2. Pass lambda_smooth to ZindiLoss via HPARAMS (if swept)
+        # The train.py will read HPARAMS['lambda_smooth'] when constructing the loss
+        
         print(f"\n[SWEEP] Starting trial with config: {config}")
         
-        # Compatibility Correction: hidden_dim must be divisible by transformer_heads
-        heads = HPARAMS.get('transformer_heads', 6)
-        if HPARAMS['hidden_dim'] % heads != 0:
-            old_dim = HPARAMS['hidden_dim']
-            HPARAMS['hidden_dim'] = ((old_dim // heads) + 1) * heads
-            print(f"[SWEEP] Adjusted hidden_dim for compatibility: {old_dim} -> {HPARAMS['hidden_dim']} (divisible by {heads} heads)")
-            
         # Load Data AFTER HPARAMS update to ensure correct seq_len
         df, feature_cols = build_pipeline_data()
         dataset = SolarDataset(df, feature_cols, is_train=True, hparams=HPARAMS)
@@ -279,7 +275,7 @@ def compute_refined_ranges(project_name: str, entity: str, top_k: int = 10, api_
             print(f"  {p}: [{refined[p]['min']:.2e}, {refined[p]['max']:.2e}]")
     
     # Categorical parameters: keep only values that appeared in top-K
-    categorical_params = ['hidden_dim', 'n_layers', 'transformer_heads']
+    categorical_params = ['hidden_dim', 'n_layers', 'station_embed_dim']
     for p in categorical_params:
         values = [run.config.get(p) for run in top_runs if p in run.config]
         if values:
@@ -316,18 +312,16 @@ def normalize_sweep_id(sweep_id: str):
 # Sweep Launcher
 # ------------------------------------------------------------------
 def get_default_sweep_config():
-    """Return the default (exploration) sweep configuration.
+    """Return the default (exploration) sweep configuration for BiLSTM.
     
-    Divisibility guarantee:
-        hidden_dim in {128, 192, 256}
-        transformer_heads in {4, 8}
-        All combinations divide evenly:
-          128/4=32, 128/8=16, 192/4=48, 192/8=24, 256/4=64, 256/8=32
-    
-    Phase integration:
-        - Curriculum learning (on/off toggle)
-        - SWA (on/off toggle)
-        - Huber delta and switch fraction (continuous)
+    Search space designed for the reverted PhysicsInformedBiLSTM:
+      - hidden_dim: BiLSTM hidden size (output dim = 2x this, bidirectional)
+      - n_layers: BiLSTM layers (2-3 is the sweet spot for solar)
+      - dropout: regularization (BiLSTM is more sensitive than Transformers)
+      - lr: learning rate for AdamW
+      - weight_decay: L2 regularization
+      - station_embed_dim: station embedding dimension
+      - lambda_smooth: kt regularization weight in ZindiLoss
     """
     return {
         'method': 'bayes',
@@ -337,32 +331,22 @@ def get_default_sweep_config():
         },
         'early_terminate': {
             'type': 'hyperband',
-            'min_iter': 5,
+            'min_iter': 8,
             's': 2
         },
         'parameters': {
-            # Architecture
-            'patch_len':         {'values': [8, 12, 16]},
-            'stride':            {'values': [4, 6, 8]},
-            'hidden_dim':        {'values': [128, 192, 256]},
-            'n_layers':          {'values': [3, 4, 6]},
-            'transformer_heads': {'values': [4, 8]},
+            # BiLSTM Architecture
+            'hidden_dim':        {'values': [128, 160, 192, 256]},
+            'n_layers':          {'values': [2, 3]},
             'dropout':           {'distribution': 'uniform', 'min': 0.05, 'max': 0.30},
+            'station_embed_dim': {'values': [8, 16, 32]},
             
             # Optimization
-            'lr':                {'distribution': 'log_uniform_values', 'min': 5e-5, 'max': 1e-3},
-            'weight_decay':      {'distribution': 'log_uniform_values', 'min': 1e-6, 'max': 1e-3},
+            'lr':                {'distribution': 'log_uniform_values', 'min': 3e-4, 'max': 3e-3},
+            'weight_decay':      {'distribution': 'log_uniform_values', 'min': 1e-5, 'max': 1e-3},
             
-            # Phase 2: Curriculum Learning
-            'use_curriculum':    {'values': [True, False]},
-            
-            # Phase 3: Loss Annealing (MSE -> Huber) + MBE anchor
-            'huber_delta_kt':    {'distribution': 'uniform', 'min': 0.01, 'max': 0.08},
-            'huber_switch_frac': {'distribution': 'uniform', 'min': 0.40, 'max': 0.80},
-            'lambda_mbe':        {'distribution': 'log_uniform_values', 'min': 0.005, 'max': 0.05},
-            
-            # Phase 4: SWA
-            'use_swa':           {'values': [True, False]},
+            # Loss regularization
+            'lambda_smooth':     {'distribution': 'log_uniform_values', 'min': 1e-4, 'max': 1e-2},
         }
     }
 
