@@ -134,6 +134,8 @@ def train_model(dataset, feature_cols: list, val_months: list = None,
         n_layers=HPARAMS['n_layers'],
         embed_dim=HPARAMS.get('station_embed_dim', 16),
         dropout=HPARAMS['dropout'],
+        use_attention=HPARAMS.get('use_attention', False),
+        attn_dropout=HPARAMS.get('attn_dropout', 0.1),
     ).to(device)
 
     param_count = sum(p.numel() for p in model.parameters())

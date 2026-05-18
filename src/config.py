@@ -127,7 +127,7 @@ HPARAMS = {
 }
 
 # ------------------------------------------------------------------
-# 2b. STAGE 2: LightGBM Configuration (parallel sqrt-residual)
+# 2b. STAGE 2: LightGBM Configuration (sequential residual correction)
 # ------------------------------------------------------------------
 STAGE2_HPARAMS = {
     'n_estimators': 420,
@@ -139,9 +139,6 @@ STAGE2_HPARAMS = {
     'min_child_samples': 20,
     'reg_alpha': 0.1,
     'reg_lambda': 0.1,
-    # Ensemble weights
-    'w_bilstm': 0.4,
-    'w_lgbm': 0.6,
     # Calibration bounds
     'calibration_clip': [0.8, 1.2],
 }

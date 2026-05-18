@@ -1,10 +1,12 @@
 """
 Inference and submission generation for the Physics-Informed BiLSTM pipeline.
 
-Architecture (solar-sweep-1 proven):
-  - Model predicts: kt (clearness index, sigmoid-bounded [0, kt_max])
+Architecture (sequential residual + boundary routing):
+  - BiLSTM predicts kt (clearness index, sigmoid-bounded [0, kt_max])
   - GHI = kt * clear_sky_ghi, night-gated to 0
-  - Missing predictions: use MDSSF satellite value (NOT 0)
+  - Interior samples: ghi_final = bilstm + lgbm_residual (sequential)
+  - Boundary samples: ghi_final = lgbm_standalone (direct GHI prediction)
+  - NO MDSSF satellite fallback (evidence: MDSSF RMSE=466 contaminates score)
   - FP32 inference (no AMP)
 """
 
@@ -14,7 +16,7 @@ import pandas as pd
 import torch
 from torch.utils.data import DataLoader
 
-from src.config import HPARAMS, PATHS, STAGE2_HPARAMS, ensure_dirs, get_n_stations
+from src.config import HPARAMS, PATHS, ensure_dirs, get_n_stations
 from src.model_lstm import PhysicsInformedBiLSTM
 from src.utils import get_device, clean_memory
 
@@ -56,16 +58,19 @@ def predict(dataset, models=None, model_paths: list = None,
 
         for path in model_paths:
             ckpt = torch.load(path, map_location=device, weights_only=False)
+            ckpt_hparams = ckpt.get('hparams', {})
             n_features = len(ckpt.get('feature_cols', feature_cols or []))
             n_stations = get_n_stations()
 
             m = PhysicsInformedBiLSTM(
                 n_features=n_features,
                 n_stations=n_stations,
-                hidden_dim=HPARAMS['hidden_dim'],
-                n_layers=HPARAMS['n_layers'],
-                embed_dim=HPARAMS.get('station_embed_dim', 16),
-                dropout=HPARAMS['dropout'],
+                hidden_dim=ckpt_hparams.get('hidden_dim', HPARAMS['hidden_dim']),
+                n_layers=ckpt_hparams.get('n_layers', HPARAMS['n_layers']),
+                embed_dim=ckpt_hparams.get('station_embed_dim', HPARAMS.get('station_embed_dim', 16)),
+                dropout=ckpt_hparams.get('dropout', HPARAMS['dropout']),
+                use_attention=ckpt_hparams.get('use_attention', HPARAMS.get('use_attention', False)),
+                attn_dropout=ckpt_hparams.get('attn_dropout', HPARAMS.get('attn_dropout', 0.1)),
             ).to(device)
             m.load_state_dict(ckpt['model_state_dict'])
             m.eval()
@@ -131,22 +136,30 @@ def predict(dataset, models=None, model_paths: list = None,
 
 
 def generate_submission(predictions: dict, output_path: str = None,
+                        boundary_predictions: dict = None,
                         fallback_df: pd.DataFrame = None):
     """
     Generate Zindi-format submission CSV.
 
-    CRITICAL FIX: Missing predictions (983 IDs from window boundary effects)
-    are filled with MDSSF satellite values instead of 0.0.
+    Routing logic (evidence-backed):
+      1. Interior samples: use BiLSTM predictions (+ optional LGBM residual correction)
+      2. Boundary samples: use LightGBM standalone predictions (boundary_predictions dict)
+      3. Last resort: 0.0 (should never happen if pipeline is correct)
+
+    MDSSF satellite fallback is REMOVED. Evidence: 4% of samples at RMSE=466
+    inflates overall RMSE from 86 to 126, costing ~20 Zindi points.
 
     Parameters
     ----------
     predictions : dict
-        {sample_id: predicted_ghi} from model inference.
+        {sample_id: predicted_ghi} from BiLSTM (+LGBM residual) inference.
     output_path : str
         Path to save submission CSV.
+    boundary_predictions : dict or None
+        {sample_id: predicted_ghi} from LightGBM standalone for boundary samples.
     fallback_df : pd.DataFrame or None
-        DataFrame with 'ID' and 'mdssf' columns for fallback values.
-        If None, uses max(0, MDSSF) where available, else 0.
+        DEPRECATED. Kept for backward compatibility but not used.
+        MDSSF satellite fallback is evidence-backed as harmful.
     """
     ensure_dirs()
 
@@ -163,32 +176,35 @@ def generate_submission(predictions: dict, output_path: str = None,
         all_ids = list(predictions.keys())
         print(f"  Using prediction IDs: {len(all_ids)} rows")
 
-    # Build fallback lookup from MDSSF satellite values
-    fallback_lookup = {}
-    if fallback_df is not None and 'ID' in fallback_df.columns and 'mdssf' in fallback_df.columns:
-        for _, row in fallback_df[['ID', 'mdssf']].dropna().iterrows():
-            fallback_lookup[row['ID']] = max(0.0, float(row['mdssf']))
-        print(f"  Fallback MDSSF values loaded for {len(fallback_lookup)} IDs")
+    if boundary_predictions is None:
+        boundary_predictions = {}
 
-    # Build submission
+    # Build submission with routing
     rows = []
+    interior_count = 0
+    boundary_count = 0
     missing_count = 0
-    fallback_count = 0
+    
     for sid in all_ids:
         if sid in predictions:
             val = predictions[sid]
-        elif sid in fallback_lookup:
-            val = fallback_lookup[sid]
-            fallback_count += 1
+            interior_count += 1
+        elif sid in boundary_predictions:
+            val = boundary_predictions[sid]
+            boundary_count += 1
         else:
+            # Last resort -- should not happen in correct pipeline
             val = 0.0
             missing_count += 1
         rows.append({'ID': sid, 'TargetMBE': val, 'TargetRMSE': val})
 
-    if fallback_count > 0:
-        print(f"  INFO: {fallback_count} test IDs used MDSSF satellite fallback")
+    print(f"  Routing: {interior_count} interior (BiLSTM), "
+          f"{boundary_count} boundary (LightGBM), "
+          f"{missing_count} missing (0.0)")
+    
     if missing_count > 0:
-        print(f"  WARNING: {missing_count} test IDs had no prediction or fallback (filled with 0)")
+        print(f"  WARNING: {missing_count} test IDs had no prediction! "
+              f"Check boundary detection logic.")
 
     submission = pd.DataFrame(rows)
 
@@ -203,37 +219,31 @@ def generate_submission(predictions: dict, output_path: str = None,
     return submission
 
 
-def stack_predictions(bilstm_preds, lgbm_preds, w_bilstm=None, w_lgbm=None):
+def stack_predictions(bilstm_preds, lgbm_residual_preds):
     """
-    Simple weighted ensemble stacking.
+    Sequential residual stacking: final = bilstm + lgbm_residual.
+    
+    NOT weighted blending. Evidence-backed: parallel blending degrades
+    score when BiLSTM is the dominant predictor (Zindi 43->53).
 
     Parameters
     ----------
     bilstm_preds : dict or np.ndarray
         BiLSTM GHI predictions.
-    lgbm_preds : dict or np.ndarray
-        LightGBM GHI predictions.
-    w_bilstm : float
-        Weight for BiLSTM (default from STAGE2_HPARAMS).
-    w_lgbm : float
-        Weight for LightGBM (default from STAGE2_HPARAMS).
+    lgbm_residual_preds : dict or np.ndarray
+        LightGBM residual predictions (small corrections, ~±10-20 W/m2).
 
     Returns
     -------
     stacked : dict or np.ndarray (same type as input)
     """
-    if w_bilstm is None:
-        w_bilstm = STAGE2_HPARAMS.get('w_bilstm', 0.4)
-    if w_lgbm is None:
-        w_lgbm = STAGE2_HPARAMS.get('w_lgbm', 0.6)
-
     if isinstance(bilstm_preds, dict):
         stacked = {}
-        all_keys = set(bilstm_preds.keys()) | set(lgbm_preds.keys())
-        for key in all_keys:
-            bi_val = bilstm_preds.get(key, 0.0)
-            lgb_val = lgbm_preds.get(key, 0.0)
-            stacked[key] = max(0.0, w_bilstm * bi_val + w_lgbm * lgb_val)
+        for key in bilstm_preds:
+            bi_val = bilstm_preds[key]
+            # If LGBM has a residual for this key, add it
+            lgb_res = lgbm_residual_preds.get(key, 0.0) if isinstance(lgbm_residual_preds, dict) else 0.0
+            stacked[key] = max(0.0, bi_val + lgb_res)
         return stacked
     else:
-        return np.maximum(0.0, w_bilstm * bilstm_preds + w_lgbm * lgbm_preds)
+        return np.maximum(0.0, bilstm_preds + lgbm_residual_preds)

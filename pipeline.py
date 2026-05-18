@@ -1,17 +1,18 @@
 """
 TAHMO Solar Radiation Challenge -- End-to-End Pipeline
-Physics-Informed BiLSTM + LightGBM Parallel Sqrt-Residual Stacking
+Physics-Informed BiLSTM + LightGBM Sequential Residual Correction
 
 This script orchestrates the full pipeline:
 Phase A (MVP): Config -> Data Loading -> Astro -> Dataset -> Model -> Train -> Predict
 Phase B (Enrichment): ERA5 -> Physics -> Temporal features
 Phase C (Satellite): LandSAF, TROPOMI, Static priors
-Phase D (Stacking): LightGBM sqrt-residual -> Ensemble -> Calibration
+Phase D (Stacking): LightGBM sequential residual -> Additive correction -> Calibration
 
-Architecture:
-    Stage 1: BiLSTM (direct kt prediction, ZindiLoss) -> Zindi ~45
-    Stage 2: LightGBM (parallel sqrt-residual from MDSSF) -> Zindi 35-40
-    Stage 3: Weighted ensemble (0.4*BiLSTM + 0.6*LightGBM) + per-station calibration -> Zindi 30-35
+Architecture (evidence-backed, 4-source consensus):
+    Stage 1: BiLSTM (direct kt prediction, ZindiLoss) -> Zindi ~43
+    Stage 2: LightGBM (sequential residual: ghi_true - bilstm_OOF) -> correction
+    Stage 3: Additive ensemble (bilstm + lgbm_residual) + per-station calibration
+    Boundary: LightGBM standalone for symmetric window edge samples
 
 Usage (Colab):
     %run pipeline.py
@@ -36,7 +37,7 @@ warnings.filterwarnings('ignore')
 # 0. Configuration and seeding
 # ------------------------------------------------------------------
 from src.config import (
-    SEED, seed_everything, PATHS, HPARAMS, STAGE2_HPARAMS, FEATURES,
+    SEED, seed_everything, PATHS, HPARAMS, FEATURES,
     ensure_dirs, get_station_meta
 )
 
@@ -237,33 +238,31 @@ def run_standard_pipeline(with_lgbm=False):
     # 8. LightGBM Stage 2 (Phase A.8) -- if enabled
     # ------------------------------------------------------------------
     lgbm_model = None
+    station_ratios = None
     if with_lgbm and all_oof_data:
         from src.stage2_lgbm import Stage2LightGBM
 
         print("\n" + "=" * 70)
-        print("PHASE A.8: LightGBM Parallel Sqrt-Residual Stacking")
+        print("PHASE A.8: LightGBM Sequential Residual Correction")
         print("=" * 70)
 
         # Convert OOF to arrays
         oof_ghi_true = np.array([r['ghi_true'] for r in all_oof_data])
-        oof_mdssf = np.array([r['mdssf_ghi'] for r in all_oof_data])
         oof_bilstm = np.array([r['ghi_pred'] for r in all_oof_data])
         oof_stations = np.array([r['station_idx'] for r in all_oof_data])
         oof_sample_ids = [r['sample_id'] for r in all_oof_data]
 
         # Build tabular features for OOF samples
-        # Map sample_ids back to rows in df to extract tabular features
         oof_features_df = _extract_features_for_samples(
             df, dataset, oof_sample_ids, feature_cols
         )
 
-        # Train LightGBM
+        # Train LightGBM on sequential residuals (ghi_true - bilstm_OOF)
         lgbm_model = Stage2LightGBM()
         lgbm_model.fit(
             ghi_true=oof_ghi_true,
-            mdssf=oof_mdssf,
             features_df=oof_features_df,
-            bilstm_preds=oof_bilstm,
+            bilstm_oof_preds=oof_bilstm,
         )
         
         # Save LightGBM model
@@ -277,45 +276,47 @@ def run_standard_pipeline(with_lgbm=False):
         print("PHASE A.8b: Per-Station Calibration (OOF)")
         print("=" * 70)
 
-        # Get LGBM predictions on OOF for calibration
-        oof_lgbm_preds = lgbm_model.predict(
-            mdssf=oof_mdssf,
+        # Get sequential residual-corrected OOF predictions
+        oof_corrected = lgbm_model.predict_residual(
             features_df=oof_features_df,
             bilstm_preds=oof_bilstm,
         )
-
-        # Ensemble OOF predictions
-        from src.predict import stack_predictions
-        oof_stacked = stack_predictions(oof_bilstm, oof_lgbm_preds)
 
         # Compute per-station calibration ratios
         valid_oof = ~np.isnan(oof_ghi_true) & (oof_ghi_true > 0)
         station_ratios = compute_station_ratios(
             y_true=oof_ghi_true[valid_oof],
-            y_pred=oof_stacked[valid_oof],
+            y_pred=oof_corrected[valid_oof],
             station_ids=oof_stations[valid_oof],
         )
+
+        # Save calibration ratios
+        import json
+        serializable_ratios = {str(k): float(v) for k, v in station_ratios.items()}
+        ratios_save_path = os.path.join(PATHS['experiments_dir'], 'station_ratios.json')
+        with open(ratios_save_path, 'w') as f:
+            json.dump(serializable_ratios, f, indent=2)
+        print(f"[PIPELINE] Saved Station Calibration Ratios to {ratios_save_path}")
 
         gc.collect()
 
     # ------------------------------------------------------------------
     # 9. Prediction (Phase A.9)
     # ------------------------------------------------------------------
-    from src.predict import predict, generate_submission, stack_predictions
+    from src.predict import predict, generate_submission
 
     print("\n" + "=" * 70)
     print("PHASE A.9: Prediction and Submission")
     print("=" * 70)
 
     if with_lgbm and lgbm_model is not None:
-        # Full pipeline: BiLSTM + LightGBM + Calibration
+        # Full pipeline: BiLSTM + Sequential Residual + Boundary + Calibration
         bilstm_preds, test_details = predict(
             dataset=dataset, models=trained_models, return_details=True
         )
 
-        # Build test features for LGBM
+        # Stage 2: Sequential residual correction for interior samples
         test_sample_ids = [d['sample_id'] for d in test_details]
-        test_mdssf = np.array([d['mdssf_ghi'] for d in test_details])
         test_bilstm = np.array([d['ghi_pred'] for d in test_details])
         test_stations = np.array([d['station_idx'] for d in test_details])
 
@@ -323,40 +324,84 @@ def run_standard_pipeline(with_lgbm=False):
             df, dataset, test_sample_ids, feature_cols
         )
 
-        # LightGBM predictions on test
-        lgbm_test_preds = lgbm_model.predict(
-            mdssf=test_mdssf,
+        # Sequential residual correction
+        interior_corrected = lgbm_model.predict_residual(
             features_df=test_features_df,
             bilstm_preds=test_bilstm,
         )
 
-        # Ensemble
-        stacked_test = stack_predictions(test_bilstm, lgbm_test_preds)
-
-        # Apply per-station calibration
+        # Apply per-station calibration to interior
         from src.calibrate import apply_calibration
-        calibrated_test = apply_calibration(stacked_test, test_stations, station_ratios)
+        calibrated_interior = apply_calibration(
+            interior_corrected, test_stations, station_ratios
+        )
 
-        # Build final predictions dict
-        predictions = {}
+        # Build interior predictions dict
+        interior_predictions = {}
         for i, sid in enumerate(test_sample_ids):
-            predictions[sid] = float(calibrated_test[i])
+            interior_predictions[sid] = float(calibrated_interior[i])
+
+        # Stage 3: Boundary detection and LightGBM standalone prediction
+        sample_sub_path = PATHS.get('sample_submission')
+        if sample_sub_path and os.path.exists(sample_sub_path):
+            all_test_ids = set(pd.read_csv(sample_sub_path)['ID'].tolist())
+        else:
+            all_test_ids = set()
+        
+        boundary_ids = all_test_ids - set(interior_predictions.keys())
+        boundary_predictions = {}
+        
+        if boundary_ids and len(boundary_ids) > 0:
+            print(f"\n[PIPELINE] Boundary routing: {len(boundary_ids)} samples "
+                  f"to LightGBM standalone ({len(interior_predictions)} interior)")
+            
+            test_mask = df['is_test'] == 1
+            boundary_mask = test_mask & df['ID'].isin(boundary_ids)
+            boundary_df = df.loc[boundary_mask].copy()
+            
+            if len(boundary_df) > 0:
+                all_feature_cols = [c for c in df.columns if c in (
+                    lgbm_model.feature_cols or []) and c != 'bilstm_ghi_pred']
+                if not all_feature_cols:
+                    all_feature_cols = [c for c in feature_cols if c in df.columns]
+                
+                boundary_features = boundary_df[all_feature_cols].copy()
+                boundary_features = boundary_features.fillna(0.0)
+                
+                boundary_ghi = lgbm_model.predict_boundary(
+                    features_df=boundary_features,
+                )
+                
+                if 'station_idx' in boundary_df.columns:
+                    boundary_stations = boundary_df['station_idx'].values
+                    boundary_ghi = apply_calibration(
+                        boundary_ghi, boundary_stations, station_ratios
+                    )
+                
+                for i, sid in enumerate(boundary_df['ID'].values):
+                    boundary_predictions[sid] = float(max(0.0, boundary_ghi[i]))
+                
+                print(f"[PIPELINE] Boundary predictions generated: {len(boundary_predictions)}")
+
+        predictions = interior_predictions
 
         # Log quality metrics
         bilstm_mean = np.mean(test_bilstm)
-        lgbm_mean = np.mean(lgbm_test_preds)
-        stacked_mean = np.mean(stacked_test)
-        cal_mean = np.mean(calibrated_test)
+        corrected_mean = np.mean(interior_corrected)
+        cal_mean = np.mean(calibrated_interior)
         print(f"\n[PIPELINE] Prediction means:")
         print(f"  BiLSTM:      {bilstm_mean:.2f} W/m2")
-        print(f"  LightGBM:    {lgbm_mean:.2f} W/m2")
-        print(f"  Stacked:     {stacked_mean:.2f} W/m2")
+        print(f"  +Residual:   {corrected_mean:.2f} W/m2")
         print(f"  Calibrated:  {cal_mean:.2f} W/m2")
     else:
         # BiLSTM-only pipeline
         predictions = predict(dataset=dataset, models=trained_models)
+        boundary_predictions = {}
 
-    submission = generate_submission(predictions)
+    submission = generate_submission(
+        predictions, 
+        boundary_predictions=boundary_predictions,
+    )
 
     # ------------------------------------------------------------------
     # Summary
@@ -370,9 +415,7 @@ def run_standard_pipeline(with_lgbm=False):
         print(f"  {fold['name'].upper()} Best Zindi: {history['val_zindi'][best_idx]:.4f} "
               f"(MBE: {history['val_mbe'][best_idx]:.2f}, RMSE: {history['val_rmse'][best_idx]:.2f})")
     if with_lgbm:
-        print(f"  Stage 2: LightGBM + Calibration ACTIVE")
-        print(f"  Ensemble weights: BiLSTM={STAGE2_HPARAMS['w_bilstm']}, "
-              f"LightGBM={STAGE2_HPARAMS['w_lgbm']}")
+        print(f"  Stage 2: LightGBM Sequential Residual + Boundary Routing ACTIVE")
     print(f"  Submission rows:      {len(submission):,}")
     print(f"  Submission saved to:  {PATHS['submissions_dir']}")
 

@@ -1,10 +1,16 @@
 """
-W&B Bayesian Hyperparameter Sweep with Adaptive Cross-Sweep Learning.
+W&B Bayesian Hyperparameter Sweep with Sequential Residual LightGBM.
 
 Supports three modes:
   1. python3 sweep.py                  -- Launch a new sweep (exploration)
   2. python3 sweep.py --resume SWEEP_ID -- Resume an existing sweep
   3. python3 sweep.py --refine          -- Narrow ranges from top-K prior runs (exploitation)
+
+Architecture (evidence-backed, 4-source consensus):
+  - BiLSTM predicts kt -> GHI (primary model)
+  - LightGBM trains on OOF residuals: r = ghi_true - ghi_bilstm_OOF (sequential)
+  - Boundary samples (symmetric window edges): LightGBM standalone predictions
+  - NO MDSSF satellite fallback (evidence: costs ~20 Zindi points)
 
 Global best model persistence:
   - A single 'global_best_model.pt' is maintained across ALL trials and sweeps.
@@ -35,15 +41,31 @@ def get_feature_hash(feature_cols):
 
 # W&B Login will be handled in the __main__ block via --api_key or environment variables.
 
-from src.config import WANDB_CONFIG, HPARAMS, STAGE2_HPARAMS, PATHS
+from src.config import WANDB_CONFIG, HPARAMS, PATHS
 from src.dataset import SolarDataset
 from pipeline import build_pipeline_data, _extract_features_for_samples
 from src.train import train_model
 from src.predict import predict, generate_submission, stack_predictions
 from src.dataset import create_test_dataset
 
-# Module-level flag set by CLI --with-lgbm
+# ------------------------------------------------------------------
+# Ablation Control Flags (set by CLI -- do NOT edit directly)
+# ------------------------------------------------------------------
+# Ablation 1: Route symmetric window boundary samples to LGBM standalone
+#             instead of MDSSF satellite fallback (evidence: ~20 Zindi points)
+USE_BOUNDARY_LGBM = False  # requires USE_LGBM=True
+
+# Ablation 2: Sequential residual LightGBM correction (BiLSTM + LGBM residual)
+#             Replaces parallel sqrt-residual stacking
 USE_LGBM = False
+
+# Ablation 3: Bahdanau additive attention in BiLSTM
+#             evidence: -7.9% RMSE (p<0.01)
+USE_ATTENTION = False
+
+# Ablation 4: Lean ~32-feature set (remove lu_* OHE, add 6 beyond-window features)
+#             evidence: 8x hidden:feature ratio is optimal
+USE_LEAN_FEATURES = False
 
 
 # ------------------------------------------------------------------
@@ -100,6 +122,27 @@ def try_update_global_best(checkpoint_path: str, val_zindi: float,
         # Copy checkpoint to global best location
         shutil.copy2(checkpoint_path, GLOBAL_BEST_MODEL_PATH)
         
+        # Also copy LightGBM and Calibration Ratios if present in the same folder!
+        trial_dir = os.path.dirname(checkpoint_path)
+        lgbm_src = os.path.join(trial_dir, 'stage2_lgbm.pkl')
+        ratios_src = os.path.join(trial_dir, 'station_ratios.json')
+        
+        lgbm_dest = os.path.join(GLOBAL_BEST_DIR, 'stage2_lgbm.pkl')
+        ratios_dest = os.path.join(GLOBAL_BEST_DIR, 'station_ratios.json')
+        
+        # Remove old ones if they exist
+        if os.path.exists(lgbm_dest):
+            os.remove(lgbm_dest)
+        if os.path.exists(ratios_dest):
+            os.remove(ratios_dest)
+            
+        if os.path.exists(lgbm_src):
+            shutil.copy2(lgbm_src, lgbm_dest)
+            print(f"[GLOBAL BEST] Copied Stage 2 LightGBM model to global best directory.")
+        if os.path.exists(ratios_src):
+            shutil.copy2(ratios_src, ratios_dest)
+            print(f"[GLOBAL BEST] Copied Station Calibration Ratios to global best directory.")
+        
         # Write manifest with provenance
         new_manifest = {
             'val_zindi': float(val_zindi),
@@ -116,6 +159,13 @@ def try_update_global_best(checkpoint_path: str, val_zindi: float,
                 metadata=new_manifest
             )
             artifact.add_file(GLOBAL_BEST_MODEL_PATH)
+            
+            # Add LightGBM and Station Ratios to the artifact too!
+            if os.path.exists(lgbm_dest):
+                artifact.add_file(lgbm_dest)
+            if os.path.exists(ratios_dest):
+                artifact.add_file(ratios_dest)
+                
             wandb.log_artifact(artifact)
         
         print(f"[GLOBAL BEST] NEW BEST: {val_zindi:.4f} (prev: {prev_score})")
@@ -135,8 +185,8 @@ def run_sweep_agent(config=None):
     
     If USE_LGBM is True, each trial also runs:
       1. BiLSTM training with OOF collection
-      2. LightGBM sqrt-residual training on OOF
-      3. Weighted ensemble + per-station calibration
+      2. LightGBM sequential residual training on OOF residuals
+      3. Additive residual correction + per-station calibration
       4. Final stacked Zindi score logged as the sweep metric
     """
     # Initialize wandb run
@@ -164,6 +214,9 @@ def run_sweep_agent(config=None):
             'meta/feature_hash': get_feature_hash(feature_cols),
             'meta/seed': SEED,
             'meta/use_lgbm': USE_LGBM,
+            'meta/use_boundary_lgbm': USE_BOUNDARY_LGBM,
+            'meta/use_attention': USE_ATTENTION,
+            'meta/use_lean_features': USE_LEAN_FEATURES,
         })
         
         # Pull experiments_dir from PATHS (not HPARAMS)
@@ -171,6 +224,13 @@ def run_sweep_agent(config=None):
         sweep_save_dir = os.path.join(PATHS['experiments_dir'], f"sweep_{run_name}")
         
         try:
+            # Apply USE_ATTENTION config to HPARAMS before model construction
+            if USE_ATTENTION:
+                HPARAMS['use_attention'] = True
+                HPARAMS['attn_dropout'] = config.get('attn_dropout', 0.1)
+            else:
+                HPARAMS['use_attention'] = False
+            
             # ---- Stage 1: BiLSTM Training ----
             result = train_model(
                 dataset, 
@@ -191,7 +251,7 @@ def run_sweep_agent(config=None):
             best_idx = np.argmin(history['val_zindi'])
             print(f"[SWEEP] BiLSTM best Zindi: {bilstm_zindi:.4f}")
             
-            # ---- Stage 2: LightGBM Stacking (if enabled) ----
+            # ---- Stage 2: Sequential Residual LightGBM (if enabled) ----
             final_zindi = bilstm_zindi
             lgbm_model = None
             station_ratios = None
@@ -200,11 +260,10 @@ def run_sweep_agent(config=None):
                 from src.stage2_lgbm import Stage2LightGBM
                 from src.calibrate import compute_station_ratios, apply_calibration
                 
-                print(f"\n[SWEEP] Stage 2: LightGBM on {len(oof_data)} OOF samples...")
+                print(f"\n[SWEEP] Stage 2: Sequential Residual LightGBM on {len(oof_data)} OOF samples...")
                 
                 # Convert OOF to arrays
                 oof_ghi_true = np.array([r['ghi_true'] for r in oof_data])
-                oof_mdssf = np.array([r['mdssf_ghi'] for r in oof_data])
                 oof_bilstm = np.array([r['ghi_pred'] for r in oof_data])
                 oof_stations = np.array([r['station_idx'] for r in oof_data])
                 oof_sample_ids = [r['sample_id'] for r in oof_data]
@@ -214,40 +273,42 @@ def run_sweep_agent(config=None):
                     df, dataset, oof_sample_ids, feature_cols
                 )
                 
-                # Train LightGBM
+                # Train LightGBM on SEQUENTIAL RESIDUALS (ghi_true - bilstm_OOF)
                 lgbm_model = Stage2LightGBM()
                 lgbm_model.fit(
                     ghi_true=oof_ghi_true,
-                    mdssf=oof_mdssf,
                     features_df=oof_features_df,
-                    bilstm_preds=oof_bilstm,
+                    bilstm_oof_preds=oof_bilstm,
                 )
                 
                 # Save LightGBM model
                 lgbm_save_path = os.path.join(sweep_save_dir, 'stage2_lgbm.pkl')
                 lgbm_model.save(lgbm_save_path)
                 
-                # Get LightGBM OOF predictions for calibration
-                oof_lgbm_preds = lgbm_model.predict(
-                    mdssf=oof_mdssf,
+                # Get sequential residual-corrected OOF predictions
+                oof_corrected = lgbm_model.predict_residual(
                     features_df=oof_features_df,
                     bilstm_preds=oof_bilstm,
                 )
-                
-                # Ensemble OOF predictions
-                oof_stacked = stack_predictions(oof_bilstm, oof_lgbm_preds)
                 
                 # Per-station calibration ratios
                 valid_oof = ~np.isnan(oof_ghi_true) & (oof_ghi_true > 0)
                 station_ratios = compute_station_ratios(
                     y_true=oof_ghi_true[valid_oof],
-                    y_pred=oof_stacked[valid_oof],
+                    y_pred=oof_corrected[valid_oof],
                     station_ids=oof_stations[valid_oof],
                 )
                 
+                # Save station calibration ratios
+                import json
+                serializable_ratios = {str(k): float(v) for k, v in station_ratios.items()}
+                ratios_save_path = os.path.join(sweep_save_dir, 'station_ratios.json')
+                with open(ratios_save_path, 'w') as f:
+                    json.dump(serializable_ratios, f, indent=2)
+                
                 # Calibrated OOF score (this is what the leaderboard will see)
                 oof_calibrated = apply_calibration(
-                    oof_stacked[valid_oof],
+                    oof_corrected[valid_oof],
                     oof_stations[valid_oof],
                     station_ratios,
                 )
@@ -256,7 +317,11 @@ def run_sweep_agent(config=None):
                 stacked_rmse = float(np.sqrt(np.mean(residuals ** 2)))
                 final_zindi = 0.5 * stacked_mbe + 0.5 * stacked_rmse
                 
-                print(f"[SWEEP] Stacked Zindi: {final_zindi:.4f} "
+                # Log residual statistics for monitoring
+                oof_residuals = oof_ghi_true[valid_oof] - oof_bilstm[valid_oof]
+                print(f"[SWEEP] BiLSTM OOF residual stats: "
+                      f"mean={oof_residuals.mean():.2f}, std={oof_residuals.std():.2f}")
+                print(f"[SWEEP] Sequential Zindi: {final_zindi:.4f} "
                       f"(BiLSTM-only: {bilstm_zindi:.4f}, "
                       f"improvement: {bilstm_zindi - final_zindi:.4f})")
                 
@@ -266,6 +331,8 @@ def run_sweep_agent(config=None):
                     'val/stacked_rmse': stacked_rmse,
                     'val/stacked_zindi': final_zindi,
                     'val/lgbm_improvement': bilstm_zindi - final_zindi,
+                    'val/residual_mean': float(oof_residuals.mean()),
+                    'val/residual_std': float(oof_residuals.std()),
                 })
             
             # Log the FINAL score (stacked if LGBM, else BiLSTM-only)
@@ -293,49 +360,110 @@ def run_sweep_agent(config=None):
             test_dataset = create_test_dataset(df, feature_cols, scaler_stats, hparams=HPARAMS)
             
             if USE_LGBM and lgbm_model is not None:
-                # Full stacked inference
+                # Stage 1: BiLSTM inference (interior samples only)
                 bilstm_preds, test_details = predict(
                     test_dataset, models=[model], feature_cols=feature_cols,
                     return_details=True,
                 )
                 
                 test_sample_ids = [d['sample_id'] for d in test_details]
-                test_mdssf = np.array([d['mdssf_ghi'] for d in test_details])
                 test_bilstm = np.array([d['ghi_pred'] for d in test_details])
                 test_stations = np.array([d['station_idx'] for d in test_details])
                 
+                # Stage 2: Sequential residual correction for interior samples
                 test_features_df = _extract_features_for_samples(
                     df, dataset, test_sample_ids, feature_cols
                 )
                 
-                lgbm_test_preds = lgbm_model.predict(
-                    mdssf=test_mdssf,
+                interior_corrected = lgbm_model.predict_residual(
                     features_df=test_features_df,
                     bilstm_preds=test_bilstm,
                 )
                 
-                stacked_test = stack_predictions(test_bilstm, lgbm_test_preds)
-                calibrated_test = apply_calibration(stacked_test, test_stations, station_ratios)
+                # Apply per-station calibration to interior
+                calibrated_interior = apply_calibration(
+                    interior_corrected, test_stations, station_ratios
+                )
                 
-                predictions = {}
+                interior_predictions = {}
                 for i, sid in enumerate(test_sample_ids):
-                    predictions[sid] = float(calibrated_test[i])
+                    interior_predictions[sid] = float(calibrated_interior[i])
+                
+                # Stage 3: Boundary detection and LightGBM standalone prediction
+                # Find test IDs not covered by BiLSTM (symmetric window boundaries)
+                sample_sub_path = PATHS.get('sample_submission')
+                if sample_sub_path and os.path.exists(sample_sub_path):
+                    all_test_ids = set(pd.read_csv(sample_sub_path)['ID'].tolist())
+                else:
+                    all_test_ids = set()
+                
+                boundary_ids = all_test_ids - set(interior_predictions.keys())
+                boundary_predictions = {}
+                
+                if boundary_ids and len(boundary_ids) > 0:
+                    print(f"[SWEEP] Boundary routing: {len(boundary_ids)} samples "
+                          f"to LightGBM standalone ({len(interior_predictions)} interior)")
+                    
+                    # Extract features for boundary samples from the main dataframe
+                    test_mask = df['is_test'] == 1
+                    boundary_mask = test_mask & df['ID'].isin(boundary_ids)
+                    boundary_df = df.loc[boundary_mask].copy()
+                    
+                    if len(boundary_df) > 0:
+                        # Get all columns that match the LGBM feature set
+                        # Use all available feature columns (109-feature set)
+                        all_feature_cols = [c for c in df.columns if c in (
+                            lgbm_model.feature_cols or []) and c != 'bilstm_ghi_pred']
+                        if not all_feature_cols:
+                            # Fallback: use the same feature columns
+                            all_feature_cols = [c for c in feature_cols if c in df.columns]
+                        
+                        boundary_features = boundary_df[all_feature_cols].copy()
+                        boundary_features = boundary_features.fillna(0.0)
+                        
+                        # Predict direct GHI for boundary samples
+                        boundary_ghi = lgbm_model.predict_boundary(
+                            features_df=boundary_features,
+                        )
+                        
+                        # Apply per-station calibration to boundary predictions
+                        if 'station_idx' in boundary_df.columns:
+                            boundary_stations = boundary_df['station_idx'].values
+                            boundary_ghi = apply_calibration(
+                                boundary_ghi, boundary_stations, station_ratios
+                            )
+                        
+                        for i, sid in enumerate(boundary_df['ID'].values):
+                            boundary_predictions[sid] = float(max(0.0, boundary_ghi[i]))
+                        
+                        print(f"[SWEEP] Boundary predictions generated: {len(boundary_predictions)}")
+                else:
+                    print(f"[SWEEP] No boundary samples detected (all covered by BiLSTM)")
+                
+                predictions = interior_predictions
             else:
-                # BiLSTM-only inference
+                # BiLSTM-only inference (no LGBM)
                 predictions = predict(test_dataset, models=[model], feature_cols=feature_cols)
-            
-            # Build fallback DataFrame for missing predictions (MDSSF satellite values)
-            test_mask = df['is_test'] == 1
-            fallback_df = df.loc[test_mask, ['ID', 'mdssf']].copy() if 'ID' in df.columns and 'mdssf' in df.columns else None
+                boundary_predictions = {}
             
             sub_filename = f"submission_{run_name}.csv"
             sub_path = os.path.join(PATHS['submissions_dir'], sub_filename)
-            submission_df = generate_submission(predictions, output_path=sub_path, fallback_df=fallback_df)
+            submission_df = generate_submission(
+                predictions, 
+                output_path=sub_path, 
+                boundary_predictions=boundary_predictions,
+            )
             
             # Log submission to W&B as an artifact
             artifact = wandb.Artifact(name=f"submission_{run_name}", type="submission")
             artifact.add_file(sub_path)
             wandb.log_artifact(artifact)
+            
+            # Log routing statistics
+            wandb.log({
+                'submission/interior_count': len(predictions),
+                'submission/boundary_count': len(boundary_predictions),
+            })
             print(f"[SWEEP] Submission logged to W&B: {sub_filename}")
 
         except Exception as e:
@@ -450,14 +578,16 @@ def normalize_sweep_id(sweep_id: str):
 def get_default_sweep_config():
     """Return the default (exploration) sweep configuration for BiLSTM.
     
-    Search space designed for the reverted PhysicsInformedBiLSTM:
+    Search space designed for the PhysicsInformedBiLSTM:
       - hidden_dim: BiLSTM hidden size (output dim = 2x this, bidirectional)
-      - n_layers: BiLSTM layers (2-3 is the sweet spot for solar)
+      - n_layers: BiLSTM layers (2 is locked -- 3L causes gradient explosion)
       - dropout: regularization (BiLSTM is more sensitive than Transformers)
       - lr: learning rate for AdamW
       - weight_decay: L2 regularization
       - station_embed_dim: station embedding dimension
       - lambda_smooth: kt regularization weight in ZindiLoss
+      - use_attention: whether to use Bahdanau additive attention
+      - attn_dropout: dropout on attention weights (overfitting prevention)
     """
     return {
         'method': 'bayes',
@@ -476,6 +606,10 @@ def get_default_sweep_config():
             'n_layers':          {'value': 2},  # LOCKED: 3L causes gradient explosion
             'dropout':           {'distribution': 'uniform', 'min': 0.05, 'max': 0.30},
             'station_embed_dim': {'values': [8, 16, 32]},
+
+            # Attention (Bahdanau additive, evidence-backed)
+            'use_attention':     {'value': True},  # Enable for attention ablation
+            'attn_dropout':      {'distribution': 'uniform', 'min': 0.05, 'max': 0.20},
 
             # Optimization
             'lr':                {'distribution': 'log_uniform_values', 'min': 3e-4, 'max': 3e-3},
@@ -582,13 +716,53 @@ if __name__ == '__main__':
     )
     parser.add_argument(
         '--with-lgbm', action='store_true',
-        help='Enable LightGBM stacking + calibration in each trial.'
+        help='Enable LightGBM sequential residual stacking + boundary routing (Ablation 1+2).'
+    )
+    parser.add_argument(
+        '--with-attention', action='store_true',
+        help='Enable Bahdanau additive attention in BiLSTM (Ablation 3).'
+    )
+    parser.add_argument(
+        '--with-lean-features', action='store_true',
+        help='Enable lean ~32 feature set (remove lu_* OHE, add beyond-window features) (Ablation 4).'
+    )
+    parser.add_argument(
+        '--ablation', type=str, default=None,
+        choices=['1', '2', '3', '4', '12', '123', '1234'],
+        help='Shorthand: 1=boundary(requires lgbm), 2=lgbm+boundary, 3=+attention, 4=+lean features.'
     )
     args = parser.parse_args()
-    
-    # Set module-level LightGBM flag
+
+    # Set module-level ablation flags from CLI args
     USE_LGBM = args.with_lgbm
-    
+    USE_BOUNDARY_LGBM = args.with_lgbm  # Boundary requires LGBM
+    USE_ATTENTION = args.with_attention
+    USE_LEAN_FEATURES = args.with_lean_features
+
+    # --ablation shorthand OVERRIDES individual args (cumulative: each level adds to previous)
+    if args.ablation:
+        abl = args.ablation
+        if '1' in abl or '2' in abl:
+            USE_LGBM = True
+            USE_BOUNDARY_LGBM = True
+        if '3' in abl:
+            USE_ATTENTION = True
+        if '4' in abl:
+            USE_LEAN_FEATURES = True
+
+    # Apply USE_LEAN_FEATURES: set HPARAMS flag so dataset.py can read it
+    HPARAMS['use_lean_features'] = USE_LEAN_FEATURES
+
+    # Print active ablation config
+    print("\n" + "=" * 60)
+    print("ABLATION CONFIGURATION")
+    print("=" * 60)
+    print(f"  Ablation 1 (Boundary LGBM):    {'ENABLED' if USE_BOUNDARY_LGBM else 'DISABLED'}")
+    print(f"  Ablation 2 (Sequential LGBM):  {'ENABLED' if USE_LGBM else 'DISABLED'}")
+    print(f"  Ablation 3 (Attention):        {'ENABLED' if USE_ATTENTION else 'DISABLED'}")
+    print(f"  Ablation 4 (Lean Features):    {'ENABLED' if USE_LEAN_FEATURES else 'DISABLED'}")
+    print("=" * 60 + "\n")
+
     # Handle Login
     api_key = args.api_key or os.environ.get('WANDB_API_KEY')
     try:
@@ -603,5 +777,5 @@ if __name__ == '__main__':
         print(f"[SWEEP] W&B Login failed: {e}")
         if os.environ.get('WANDB_MODE') != 'disabled':
             print("[SWEEP] Check your ~/.netrc or WANDB_API_KEY environment variable.")
-    
+
     start_sweep(resume_id=args.resume, refine=args.refine, count=args.count, api_key=api_key)

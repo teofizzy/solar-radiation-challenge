@@ -61,18 +61,70 @@ RESIDUAL_CLIP_MIN = -200.0
 RESIDUAL_CLIP_MAX = 200.0
 
 
+# Beyond-window features: encode temporal context the 12h BiLSTM cannot compute.
+# These are pre-computed rolling/lag statistics that span beyond seq_len=48.
+# Evidence: ChatGPT + NotebookLM agree these provide complementary context;
+# Gemini agrees only for features truly beyond the receptive field.
+BEYOND_WINDOW_FEATURES = [
+    'rolling_24h_cloud_std',    # Cloud variability over 24h (beyond 12h window)
+    'rolling_72h_kt_anomaly',   # Clearness index anomaly vs 3-day mean
+    'ewma_kt_24h',              # Exponential drift tracking over 24h
+    'mdssf_lag_4',              # Satellite lag at 1h (recent cloud movement)
+    'kt_landsaf_lag_4',         # Clearness index lag at 1h
+    'volatility_index',         # Pre-computed variability metric
+]
+
+
 def get_feature_columns(df: pd.DataFrame) -> list:
     """
-    Return the LEAN feature set for BiLSTM (~34 features).
-    Excludes rolling/lag/EWMA (redundant for sequence models).
-    """
-    candidates = (ASTRO_FEATURES + ERA5_FEATURES + PHYSICS_FEATURES +
-                  LOCAL_FEATURES + SATELLITE_FEATURES + STATIC_FEATURES +
-                  DRIFT_FEATURES + INTERACTION_FEATURES)
+    Return BiLSTM feature set, controlled by HPARAMS['use_lean_features'].
 
-    # Add Land Use OHE (e.g. lu_12) -- static per station
-    lu_cols = sorted([c for c in df.columns if c.startswith('lu_')])
-    candidates += lu_cols
+    FULL mode (default, Ablation 1+2):
+    - ~109 features (proven solar-sweep-1 config)
+    - Includes lu_* OHE, rolling/lag, EWMA drift features
+    - Matches the config that produced Zindi=43.17
+
+    LEAN mode (Ablation 4, use_lean_features=True):
+    - ~32 features (4-source evidence-backed)
+    - Excludes lu_* OHE (redundant with station embedding)
+    - Excludes rolling/lag/EWMA (redundant for sequence models)
+    - Includes 6 selective beyond-window features (>12h context)
+    - Maintains ~8x hidden:feature ratio at hidden_dim=256
+    """
+    from src.config import HPARAMS
+    use_lean = HPARAMS.get('use_lean_features', False)
+
+    if use_lean:
+        # Lean set: no lu_*, no rolling stats, only selective beyond-window
+        candidates = (ASTRO_FEATURES + ERA5_FEATURES + PHYSICS_FEATURES +
+                      LOCAL_FEATURES + SATELLITE_FEATURES + STATIC_FEATURES +
+                      DRIFT_FEATURES + INTERACTION_FEATURES +
+                      BEYOND_WINDOW_FEATURES)
+        # lu_* OHE deliberately excluded (see comments in BEYOND_WINDOW_FEATURES)
+    else:
+        # Full set: include everything (matches solar-sweep-1)
+        candidates = (ASTRO_FEATURES + ERA5_FEATURES + PHYSICS_FEATURES +
+                      LOCAL_FEATURES + SATELLITE_FEATURES + STATIC_FEATURES +
+                      DRIFT_FEATURES + INTERACTION_FEATURES)
+
+        # Land Use OHE (static per station)
+        lu_cols = sorted([c for c in df.columns if c.startswith('lu_')])
+        candidates = list(candidates) + lu_cols
+
+        # Rolling/lag/diff features
+        rolling_cols = sorted([c for c in df.columns if '_roll_' in c or '_diff_' in c or
+                               c in ('volatility_index', 'sticky_dust_index', 'advection_kt')])
+        candidates = candidates + rolling_cols
+
+        # Satellite lag stacks
+        lag_cols = sorted([c for c in df.columns if '_lag_' in c])
+        candidates = candidates + lag_cols
+
+        # EWMA drift features
+        ewma_cols = sorted([c for c in df.columns
+                            if c.startswith('ewma_kt_') or
+                            c in ('log_cum_exposure', 'clearness_regime_shift', 'ewma_residual_kt')])
+        candidates = candidates + ewma_cols
 
     # Filter to available and deduplicate
     seen = set()
@@ -81,6 +133,9 @@ def get_feature_columns(df: pd.DataFrame) -> list:
         if c in df.columns and c not in seen:
             seen.add(c)
             unique.append(c)
+
+    mode_tag = "LEAN" if use_lean else "FULL"
+    print(f"[DATASET] Feature set: {mode_tag} ({len(unique)} features)")
     return unique
 
 

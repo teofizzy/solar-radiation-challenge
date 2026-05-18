@@ -266,6 +266,39 @@ def compute_temporal_features(df: pd.DataFrame,
             print("  Causal EWMA Residual (kt) computed.")
 
         # ----------------------------------------------------------
+        # 5.7. Beyond-Window Features for BiLSTM
+        #      These encode temporal context beyond the 12h BiLSTM window.
+        #      All use satellite-derived covariates only (no target leakage).
+        # ----------------------------------------------------------
+        # (a) 24h cloud variability (beyond 12h window)
+        if 'kt_landsaf' in df.columns:
+            cloud_std_24h = df.groupby('station')['kt_landsaf'].transform(
+                lambda x: x.rolling(window=96, min_periods=4).std()  # 96 steps = 24h
+            )
+            new_columns['rolling_24h_cloud_std'] = cloud_std_24h.fillna(0).astype(DTYPE)
+            print("  Beyond-window: rolling_24h_cloud_std (24h kt_landsaf std)")
+
+        # (b) 72h kt anomaly (clearness index vs 3-day mean)
+        if 'kt_landsaf' in df.columns:
+            kt_72h_mean = df.groupby('station')['kt_landsaf'].transform(
+                lambda x: x.rolling(window=288, min_periods=8).mean()  # 288 steps = 72h
+            )
+            new_columns['rolling_72h_kt_anomaly'] = (
+                (df['kt_landsaf'].values - kt_72h_mean.values)
+            ).astype(DTYPE)
+            # Replace NaN from rolling warmup
+            new_columns['rolling_72h_kt_anomaly'] = new_columns['rolling_72h_kt_anomaly'].fillna(0)
+            print("  Beyond-window: rolling_72h_kt_anomaly (kt vs 3-day mean)")
+
+        # (c) EWMA kt 24h (exponential drift tracker over 24h)
+        if 'kt_landsaf' in df.columns:
+            ewma_24h = df.groupby('station')['kt_landsaf'].transform(
+                lambda x: x.ewm(span=96, min_periods=1).mean()  # span=96 ~ 24h half-life
+            )
+            new_columns['ewma_kt_24h'] = ewma_24h.fillna(0).astype(DTYPE)
+            print("  Beyond-window: ewma_kt_24h (24h exponential drift)")
+
+        # ----------------------------------------------------------
         # 6. Cloud Motion Proxies (Advection)
         #    Advection = -(u * dKt/dx + v * dKt/dy)
         #    Requires KNN spatial gradients of kt_landsaf
