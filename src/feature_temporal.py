@@ -283,11 +283,9 @@ def compute_temporal_features(df: pd.DataFrame,
             kt_72h_mean = df.groupby('station')['kt_landsaf'].transform(
                 lambda x: x.rolling(window=288, min_periods=8).mean()  # 288 steps = 72h
             )
-            new_columns['rolling_72h_kt_anomaly'] = (
-                (df['kt_landsaf'].values - kt_72h_mean.values)
-            ).astype(DTYPE)
-            # Replace NaN from rolling warmup
-            new_columns['rolling_72h_kt_anomaly'] = new_columns['rolling_72h_kt_anomaly'].fillna(0)
+            # Compute subtraction in pandas (not numpy) so .fillna() is available
+            rolling_72h_kt_anomaly = (df['kt_landsaf'] - kt_72h_mean).fillna(0)
+            new_columns['rolling_72h_kt_anomaly'] = rolling_72h_kt_anomaly.astype(DTYPE)
             print("  Beyond-window: rolling_72h_kt_anomaly (kt vs 3-day mean)")
 
         # (c) EWMA kt 24h (exponential drift tracker over 24h)
